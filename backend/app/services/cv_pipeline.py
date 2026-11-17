@@ -306,7 +306,7 @@ class TrueDisplacementTracker:
             self.tracks[slot] = {
                 "cx": cx, "cy": cy, "foot_y": det["y"] + det["h"] * 0.95, "area": det["area"],
                 "category": det["category"], "face_name": None, "face_role": None, "face_score": 0.0, "face_sightings": 1,
-                "breach_latched": False, "breach_logged": False, "identity_logged": None, "last_seen": now,
+                "breach_latched": False, "pending_tripwire": False, "breach_logged": False, "identity_logged": None, "last_seen": now,
                 "history": deque([(cx, cy, 0.0, now)], maxlen=8),
             }
             det["step_disp"] = 0.0
@@ -318,6 +318,13 @@ class TrueDisplacementTracker:
 
         for slot, det in assigned:
             tr = self.tracks[slot]
+            touched_tw_frame = any(
+                z["zone_type"] == "tripwire" and bbox_or_step_touches_polygon(det, z["points"], det.get("prev_foot"))
+                for z in cam_zones
+            )
+            if touched_tw_frame:
+                tr["pending_tripwire"] = True
+
             hist = tr["history"]
             if len(hist) < 2:
                 continue
@@ -350,15 +357,13 @@ class TrueDisplacementTracker:
                 recognized_sightings = tr.get("face_sightings", 1)
 
             strong_whitelist = recognized_role == "whitelist" and recognized_score >= 0.52
-            crossed_tripwire_now = any(
-                z["zone_type"] == "tripwire" and bbox_or_step_touches_polygon(det, z["points"], det.get("prev_foot"))
-                for z in cam_zones
-            ) and (not strong_whitelist)
+            crossed_tripwire_now = (touched_tw_frame or bool(tr.get("pending_tripwire", False))) and (not strong_whitelist)
 
             if crossed_tripwire_now:
                 tr["breach_latched"] = True
             elif strong_whitelist:
                 tr["breach_latched"] = False
+                tr["pending_tripwire"] = False
 
             is_breach = bool(tr.get("breach_latched", False))
             is_watchlist = recognized_role in ("watchlist", "watchlist_auto")

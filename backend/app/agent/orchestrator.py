@@ -4,6 +4,7 @@ import json
 import os
 import time
 from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+import cv2
 import httpx
 from sqlalchemy import select, func, delete
 from app.db.session import AsyncSessionLocal
@@ -54,6 +55,33 @@ def extract_json_dict(raw_text: str) -> dict:
     if start != -1 and end != -1 and end > start:
         return json.loads(raw_text[start : end + 1])
     return json.loads(raw_text)
+
+
+def _encode_vlm_image_b64(img_path: str, max_dim: int = 896, quality: int = 84) -> str | None:
+    if not img_path or not os.path.exists(img_path):
+        return None
+    try:
+        img = cv2.imread(img_path)
+        if img is not None and img.size > 0:
+            h, w = img.shape[:2]
+            peak = max(h, w)
+            if peak > max_dim:
+                scale = max_dim / float(peak)
+                img = cv2.resize(
+                    img,
+                    (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            if ok:
+                return base64.b64encode(enc.tobytes()).decode("utf-8")
+    except Exception:
+        pass
+    try:
+        with open(img_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    except Exception:
+        return None
 
 
 def _is_isaac_event(sub_type: str | None, full_label: str | None, ai_notes: str | None = None) -> bool:
@@ -456,17 +484,21 @@ async def deep_inspect_detection(event_id: int) -> dict:
                 else (crop_path if os.path.exists(crop_path) else full_path)
             )
             ai_notes_out = existing_note
+            vlm_succeeded = False
 
             if chosen_vlm and img_to_send and os.path.exists(img_to_send):
                 try:
-                    with open(img_to_send, "rb") as f:
-                        images_b64 = [base64.b64encode(f.read()).decode("utf-8")]
+                    primary_max_dim = 1024 if ev.category == "vehicle" else (960 if ev.category == "animal" else 672)
+                    primary_b64 = _encode_vlm_image_b64(img_to_send, max_dim=primary_max_dim, quality=88 if ev.category == "vehicle" else 84)
+                    images_b64 = [primary_b64] if primary_b64 else []
                     if ev.category in ("person", "delivery") and full_path and full_path != img_to_send and os.path.exists(full_path):
-                        with open(full_path, "rb") as ff:
-                            images_b64.append(base64.b64encode(ff.read()).decode("utf-8"))
+                        ctx_b64 = _encode_vlm_image_b64(full_path, max_dim=896, quality=82)
+                        if ctx_b64:
+                            images_b64.append(ctx_b64)
                     elif ev.category == "vehicle" and plate_path and os.path.exists(plate_path):
-                        with open(plate_path, "rb") as pf:
-                            images_b64.append(base64.b64encode(pf.read()).decode("utf-8"))
+                        plate_b64 = _encode_vlm_image_b64(plate_path, max_dim=960, quality=92)
+                        if plate_b64:
+                            images_b64.append(plate_b64)
 
                     prompt = (
                         f"Analyze this security camera image from '{ev.camera_id}' (initial detector guess: category={ev.category}, sub_type={ev.sub_type}). "
@@ -478,7 +510,7 @@ async def deep_inspect_detection(event_id: int) -> dict:
                         "If a person is walking an animal on a sidewalk/leash, classify sub_type as 'dog' and mention the owner/leash in summary. "
                         "If a small four-legged animal is alone on the driveway/pavement with NO person or leash visible, classify sub_type as 'cat'. "
                         "If a vehicle is visible, inspect both the vehicle and bumper crop to read any legible license plate characters into 'plate' (or 'NONE'). "
-                        f"If a commercial delivery carrier or service crew (like LANDSCAPERS with mowers/blowers/vests/bandanas or AMAZON/UPS/FEDEX/USPS with branded vest/uniform, delivery van/truck, or shipping box) is visible, set 'carrier' to one of {active_rule_names} (or 'NONE') and note if a package was left. "
+                        f"If a commercial delivery carrier or service crew (like LANDSCAPERS with mowers/blowers/vests/bandanas or AMAZON/UPS/FEDEX/USPS with branded vest/uniform, high-vis safety vest with handheld delivery scanner phone, delivery van/truck, or shipping box) is visible, set 'carrier' to one of {active_rule_names} (or 'NONE') and note if a package was left. "
                         "CRITICAL GUARDRAIL: Residents or people in casual clothes rolling wheeled curbside trash, recycling, or yard-waste bins (blue, black, green, or gray plastic carts with lids/wheels) or walking around parked household vehicles without a commercial delivery uniform or delivery van are household activity ('category': 'person', 'carrier': 'NONE') — NEVER classify wheeled blue recycling/trash bins as AMAZON. "
                         "Set 'face_visible' to true ONLY if a person's actual facial features (eyes/nose) are clearly visible in Image 1 (the close-up crop); set 'face_visible' to false if walking away, only the back of their head/hoodie/backpack is visible, blurry night silhouette, or head cropped out. "
                         "Respond ONLY with valid JSON: "
@@ -498,11 +530,28 @@ async def deep_inspect_detection(event_id: int) -> dict:
                                 "images": images_b64,
                                 "format": "json",
                                 "stream": False,
-                                "options": {"temperature": 0.1},
+                                "options": {"temperature": 0.1, "num_ctx": 8192},
                             },
                         )
+                        if resp.status_code != 200 and len(images_b64) > 1:
+                            print(f"[DEEP INSPECT VLM HTTP {resp.status_code}] Retrying single-image fallback: {resp.text[:200]}")
+                            resp = await client.post(
+                                f"{WORKSTATION_GPU_URL}/api/generate",
+                                json={
+                                    "model": chosen_vlm,
+                                    "prompt": prompt,
+                                    "images": images_b64[:1],
+                                    "format": "json",
+                                    "stream": False,
+                                    "options": {"temperature": 0.1, "num_ctx": 8192},
+                                },
+                            )
+                        elif resp.status_code != 200:
+                            print(f"[DEEP INSPECT VLM HTTP {resp.status_code}] {resp.text[:240]}")
+
                         if resp.status_code == 200:
                             parsed = extract_json_dict(resp.json().get("response", "{}"))
+                            vlm_succeeded = True
                             valid_target = bool(parsed.get("valid_target", True))
                             face_visible = bool(parsed.get("face_visible", True))
                             vlm_cat = str(parsed.get("category") or ev.category).strip().lower()
@@ -648,7 +697,7 @@ async def deep_inspect_detection(event_id: int) -> dict:
                 "full_label": ev.full_label,
                 "attributes": ev.attributes,
                 "ai_notes": ai_notes_out,
-                "engine": f"RTX 3060 Ti // {chosen_vlm}" if chosen_vlm else "EDGE_FALLBACK",
+                "engine": f"RTX 3060 Ti // {chosen_vlm}" if vlm_succeeded else "EDGE_FALLBACK",
             }
 
 
