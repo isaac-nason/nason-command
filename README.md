@@ -147,7 +147,7 @@ flowchart LR
 
 ### 1. Clone & Configure Environment
 ```bash
-git clone git@github.com:mistabowhunta/nason-command.git
+git clone git@github.com:isaac-nason/nason-command.git
 cd nason-command
 cp .env.example .env
 cp mediamtx/mediamtx.example.yml mediamtx/mediamtx.yml
