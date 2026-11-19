@@ -24,6 +24,8 @@ from app.services.cv_pipeline import (
     health_and_sitrep_worker,
     build_and_send_sitrep,
     SNAPSHOT_DIR,
+    LOCAL_TZ,
+    is_routine_commute_window,
     get_snapshots_storage_mb,
 )
 from app.services.face_engine import face_engine, FACE_CROPS_DIR
@@ -37,7 +39,12 @@ from app.services.discord_bot import (
     set_mute_minutes_db,
     sync_discord_cheatsheet,
 )
-from app.agent.orchestrator import deep_inspect_detection, process_command_prompt, _event_touches_tripwire
+from app.agent.orchestrator import (
+    deep_inspect_detection,
+    process_command_prompt,
+    _event_touches_tripwire,
+    _scrub_parked_red_truck,
+)
 
 STREAMS = ["annke_1", "tapo_1", "tapo_2"]
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
@@ -203,11 +210,143 @@ async def _cleanup_recent_headless_false_ids():
             print(f"[FACE SANITIZER] Repaired {repaired} recent non-face DetectionEvent card(s).")
 
 
+async def purge_routine_walkers_and_scrub_notes() -> dict:
+    """
+    1. Adjusts annke_1 TRIPWIRE_1 far-right sidewalk clearance (y=0.45 -> 0.54) so angled sidewalk walkers never false-breach.
+    2. Purges routine Mon-Fri school-commute sidewalk walkers & backpack students (and deletes their JPG/MP4 files on HDD).
+    3. Scrubs '[PLATE: ABC1234 OR NONE]' and parked red Ford F-150 background chatter from remaining AI notes.
+    """
+    purged_count = 0
+    freed_bytes = 0
+    scrubbed_notes = 0
+    purged_visitor_tokens: set[str] = set()
+
+    async with AsyncSessionLocal() as session:
+        # 1. Ensure annke_1 TRIPWIRE_1 clears the angled right-side sidewalk beside the utility box
+        tw_res = await session.execute(
+            select(CameraZone).where(CameraZone.camera_id == "annke_1", CameraZone.name == "TRIPWIRE_1")
+        )
+        for z in tw_res.scalars().all():
+            try:
+                pts = json.loads(z.points_json)
+                changed_pts = False
+                for pt in pts:
+                    if abs(float(pt.get("x", 0.0)) - 0.998) < 0.01 and abs(float(pt.get("y", 0.0)) - 0.45) < 0.02:
+                        pt["y"] = 0.54
+                        changed_pts = True
+                if changed_pts:
+                    z.points_json = json.dumps(pts)
+            except Exception:
+                pass
+
+        # 2. Identify routine school-commute / backpack walker rows on annke_1
+        all_res = await session.execute(select(DetectionEvent).order_by(DetectionEvent.id.asc()))
+        all_rows = list(all_res.scalars().all())
+
+        seed_purge_rows: list[DetectionEvent] = []
+        for ev in all_rows:
+            if ev.camera_id != "annke_1" or ev.category != "person" or not ev.timestamp:
+                continue
+            u_sub = (ev.sub_type or "").upper()
+            u_lbl = (ev.full_label or "").upper()
+            if any(k in u_sub or k in u_lbl for k in ("ISAAC", "JENNIFER", "BEAU", "LYLA", "WATCHLIST", "DELIVERY", "SERVICE")):
+                continue
+            dt_loc = ev.timestamp.astimezone(LOCAL_TZ)
+            in_commute = is_routine_commute_window(dt_loc)
+            cx = float(ev.bbox_x or 0.0) + float(ev.bbox_w or 0.0) * 0.5
+            fy = float(ev.bbox_y or 0.0) + float(ev.bbox_h or 0.0) * 0.95
+            on_sidewalk = fy <= (0.34 + max(0.0, cx - 0.62) * 0.52)
+            has_backpack = "backpack" in (ev.ai_notes or "").lower()
+            if (in_commute and (on_sidewalk or has_backpack)) or (on_sidewalk and has_backpack):
+                seed_purge_rows.append(ev)
+
+        purge_ids = {r.id for r in seed_purge_rows}
+        # Include same-slot sibling frames within ±5s of a confirmed backpack commute track
+        for ev in all_rows:
+            if ev.id in purge_ids or ev.camera_id != "annke_1" or ev.category != "person" or not ev.timestamp:
+                continue
+            u_sub = (ev.sub_type or "").upper()
+            u_lbl = (ev.full_label or "").upper()
+            if any(k in u_sub or k in u_lbl for k in ("ISAAC", "JENNIFER", "BEAU", "LYLA", "WATCHLIST", "DELIVERY", "SERVICE")):
+                continue
+            if any(
+                s.motion_slot == ev.motion_slot
+                and "backpack" in (s.ai_notes or "").lower()
+                and abs((ev.timestamp - s.timestamp).total_seconds()) <= 5.0
+                for s in seed_purge_rows
+            ):
+                purge_ids.add(ev.id)
+
+        remaining_notes_blob = []
+        for ev in all_rows:
+            snap_id = (ev.attributes or "").split("|")[0].strip()
+            if ev.id in purge_ids:
+                for tok in (ev.sub_type or "").replace("(", " ").replace(")", " ").split():
+                    if tok.startswith("VISITOR_"):
+                        purged_visitor_tokens.add(tok)
+                if snap_id:
+                    for fp in (
+                        f"{SNAPSHOT_DIR}/crop_{snap_id}",
+                        f"{SNAPSHOT_DIR}/full_{snap_id}",
+                        f"{SNAPSHOT_DIR}/plate_{snap_id}",
+                        f"{SNAPSHOT_DIR}/clip_{snap_id}.mp4",
+                    ):
+                        if os.path.exists(fp):
+                            try:
+                                freed_bytes += os.path.getsize(fp)
+                                os.remove(fp)
+                            except OSError:
+                                pass
+                await session.execute(delete(DetectionEvent).where(DetectionEvent.id == ev.id))
+                purged_count += 1
+            else:
+                old_note = ev.ai_notes or ""
+                new_note = (
+                    old_note.replace("[PLATE: ABC1234 OR NONE] ", "")
+                    .replace("[PLATE: ABC1234] ", "")
+                    .replace("[PLATE: NONE] ", "")
+                )
+                if ev.camera_id == "annke_1" and ev.category != "vehicle":
+                    new_note = _scrub_parked_red_truck(new_note)
+                if new_note != old_note:
+                    ev.ai_notes = new_note
+                    ev.attributes = f"{snap_id}|{new_note}"[:250] if snap_id else new_note[:250]
+                    scrubbed_notes += 1
+                remaining_notes_blob.append((ev.sub_type or "") + " " + (ev.ai_notes or ""))
+
+        joined_remaining = "\n".join(remaining_notes_blob)
+        for vtok in purged_visitor_tokens:
+            if vtok not in joined_remaining:
+                vf_res = await session.execute(
+                    select(KnownFace).where(KnownFace.name == vtok, KnownFace.role == "visitor")
+                )
+                for vf in vf_res.scalars().all():
+                    if vf.sample_crop and str(vf.sample_crop).startswith("/face_crops/"):
+                        disk_crop = f"{FACE_CROPS_DIR}/{os.path.basename(vf.sample_crop)}"
+                        if os.path.exists(disk_crop):
+                            try:
+                                os.remove(disk_crop)
+                            except OSError:
+                                pass
+                    await session.execute(delete(KnownFace).where(KnownFace.id == vf.id))
+
+        await session.commit()
+
+    freed_mb = round(freed_bytes / 1048576.0, 2)
+    if purged_count or scrubbed_notes:
+        print(
+            f"[COMMUTE & NOTE CLEANUP] Purged {purged_count} routine walker/backpack events "
+            f"(freed {freed_mb} MB), scrubbed {scrubbed_notes} AI note(s)."
+        )
+    return {"purged_events": purged_count, "freed_mb": freed_mb, "scrubbed_notes": scrubbed_notes}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     await face_engine.sanitize_gallery_on_startup()
     await _cleanup_recent_headless_false_ids()
+    await purge_routine_walkers_and_scrub_notes()
     loop = asyncio.get_running_loop()
     event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -751,6 +890,16 @@ async def full_system_reset():
 @app.post("/api/detections/{event_id}/inspect")
 async def inspect_detection_endpoint(event_id: int):
     return await deep_inspect_detection(event_id)
+
+
+@app.post("/api/maintenance/purge-routine-walkers")
+async def purge_routine_walkers_endpoint():
+    stats = await purge_routine_walkers_and_scrub_notes()
+    cv_engine = getattr(app.state, "cv_engine", None)
+    if cv_engine:
+        await sync_zones_to_engine(cv_engine)
+    await face_engine.sync_gallery_from_db_and_disk()
+    return stats
 
 
 @app.post("/api/agent/command")

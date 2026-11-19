@@ -2,8 +2,10 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+from zoneinfo import ZoneInfo as _ZoneInfo
 import cv2
 import httpx
 from sqlalchemy import select, func, delete
@@ -55,6 +57,47 @@ def extract_json_dict(raw_text: str) -> dict:
     if start != -1 and end != -1 and end > start:
         return json.loads(raw_text[start : end + 1])
     return json.loads(raw_text)
+
+
+_LOCAL_TZ = _ZoneInfo("America/Los_Angeles")
+
+
+def _scrub_parked_red_truck(text: str) -> str:
+    if not text:
+        return text
+    low = text.lower()
+    if any(w in low for w in ("open", "touch", "tamper", "handle", "door", "bed", "tailgate", "leaning", "looking into", "breaking")):
+        return text
+    cleaned = re.sub(
+        r",?\s*(?:near|past|beside|by|next\s+to|behind|around)\s+(?:a\s+|the\s+)?(?:parked\s+)?red\s+(?:pickup\s+)?(?:truck|vehicle)(?:\s+with\s+4x4\s+badge)?(?:\s+on\s+(?:the\s+|a\s+)?driveway)?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r",?\s*(?:with\s+)?(?:a\s+|the\s+)?(?:parked\s+)?red\s+(?:pickup\s+)?truck(?:\s+with\s+4x4\s+badge)?(?:\s+(?:parked|visible|seen))?(?:\s+(?:nearby|on\s+(?:the\s+|a\s+)?driveway|in\s+(?:the\s+)?(?:background|driveway)))?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    cleaned = re.sub(r",\s*\.", ".", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,")
+    if cleaned and not cleaned.endswith(".") and text.endswith("."):
+        cleaned += "."
+    return cleaned
+
+
+def _sanitize_plate(raw_plate: str | None, category: str | None) -> str:
+    if (category or "").lower() not in ("vehicle", "delivery"):
+        return ""
+    p = (raw_plate or "").strip().upper()
+    if not p or any(tok in p for tok in ("NONE", "N/A", "UNKNOWN", "NULL", "ABC123", "1234", "ILLEGIBLE", "OR ")):
+        return ""
+    alnum = re.sub(r"[^A-Z0-9 -]", "", p).strip()
+    if len(alnum.replace(" ", "").replace("-", "")) < 3 or len(alnum) > 10:
+        return ""
+    return alnum
 
 
 def _encode_vlm_image_b64(img_path: str, max_dim: int = 896, quality: int = 84) -> str | None:
@@ -500,25 +543,33 @@ async def deep_inspect_detection(event_id: int) -> dict:
                         if plate_b64:
                             images_b64.append(plate_b64)
 
+                    resident_truck_rule = (
+                        "RESIDENT PARKED TRUCK — IGNORE COMPLETELY: The red pickup truck (Ford F-150) parked on the left side of the driveway belongs to the homeowner and is permanent background scenery. NEVER mention, describe, or analyze the parked red pickup truck in 'summary' or 'sub_type' unless a person is actively touching, opening, or tampering with it. "
+                        if ev.camera_id == "annke_1"
+                        else ""
+                    )
+
                     prompt = (
                         f"Analyze this security camera image from '{ev.camera_id}' (initial detector guess: category={ev.category}, sub_type={ev.sub_type}). "
                         "For person/delivery detections, Image 1 is the close-up subject crop and Image 2 (if provided) is the full wide scene context. "
+                        f"{resident_truck_rule}"
                         f"USER TAUGHT RULES FOR THIS CAMERA: {lessons_text or 'None'}. "
                         f"CONFIGURED DELIVERY/SERVICE RULES: {rules_text}. "
                         "Note: grayscale images are infrared night vision on dry pavement. "
                         "If this is purely an inanimate false trigger (empty pavement, wind-blown tree/shadow, IR spiderweb, stationary unattended trash bin, or headlight glare with NO actual person, vehicle, or animal present), set 'valid_target' to false and 'category' to 'false_alarm'. "
                         "If a person is walking an animal on a sidewalk/leash, classify sub_type as 'dog' and mention the owner/leash in summary. "
                         "If a small four-legged animal is alone on the driveway/pavement with NO person or leash visible, classify sub_type as 'cat'. "
-                        "If a vehicle is visible, inspect both the vehicle and bumper crop to read any legible license plate characters into 'plate' (or 'NONE'). "
+                        "Only populate 'plate' when a moving non-resident vehicle has a clearly legible alphanumeric license plate; otherwise set 'plate' to 'NONE'. "
                         f"If a commercial delivery carrier or service crew (like LANDSCAPERS with mowers/blowers/vests/bandanas or AMAZON/UPS/FEDEX/USPS with branded vest/uniform, high-vis safety vest with handheld delivery scanner phone, delivery van/truck, or shipping box) is visible, set 'carrier' to one of {active_rule_names} (or 'NONE') and note if a package was left. "
                         "CRITICAL GUARDRAIL: Residents or people in casual clothes rolling wheeled curbside trash, recycling, or yard-waste bins (blue, black, green, or gray plastic carts with lids/wheels) or walking around parked household vehicles without a commercial delivery uniform or delivery van are household activity ('category': 'person', 'carrier': 'NONE') — NEVER classify wheeled blue recycling/trash bins as AMAZON. "
+                        "Set 'school_commuter' to true ONLY if the subject is a student/youth wearing a school backpack who is casually walking along the public sidewalk or exiting away toward the street with NO package delivery and NO tampering with vehicles/house. "
                         "Set 'face_visible' to true ONLY if a person's actual facial features (eyes/nose) are clearly visible in Image 1 (the close-up crop); set 'face_visible' to false if walking away, only the back of their head/hoodie/backpack is visible, blurry night silhouette, or head cropped out. "
                         "Respond ONLY with valid JSON: "
-                        '{"valid_target": true, "face_visible": false, "category": "person|delivery|vehicle|animal|false_alarm", '
+                        '{"valid_target": true, "face_visible": false, "school_commuter": false, "category": "person|delivery|vehicle|animal|false_alarm", '
                         '"sub_type": "short label like cat, dog, white suv, or person", '
-                        '"plate": "ABC1234 or NONE", '
+                        '"plate": "NONE", '
                         f'"carrier": "{"|".join(active_rule_names)}|NONE", '
-                        '"summary": "Concise 12-20 word tactical description of subject, clothing/gear, package, or vehicle"}'
+                        '"summary": "Concise 12-20 word tactical description of the moving subject only"}'
                     )
 
                     async with httpx.AsyncClient(timeout=35.0) as client:
@@ -554,10 +605,13 @@ async def deep_inspect_detection(event_id: int) -> dict:
                             vlm_succeeded = True
                             valid_target = bool(parsed.get("valid_target", True))
                             face_visible = bool(parsed.get("face_visible", True))
+                            school_commuter = bool(parsed.get("school_commuter", False))
                             vlm_cat = str(parsed.get("category") or ev.category).strip().lower()
                             summary = (parsed.get("summary") or "").strip()
+                            if ev.camera_id == "annke_1":
+                                summary = _scrub_parked_red_truck(summary)
                             carrier = (parsed.get("carrier") or "NONE").strip().upper()
-                            plate = (parsed.get("plate") or "NONE").strip().upper()
+                            raw_plate = str(parsed.get("plate") or "NONE").strip().upper()
                             vlm_sub = (parsed.get("sub_type") or "").strip().lower()
 
                             # VLM Sanity Veto: if no face is visible (back of head, backpack, or waist-down crop),
@@ -593,10 +647,75 @@ async def deep_inspect_detection(event_id: int) -> dict:
                             if vlm_cat in ("person", "vehicle", "animal") and vlm_cat != ev.category and not recognized_face:
                                 ev.category = vlm_cat
 
-                            if plate in ("NONE", "N/A", "UNKNOWN", "NULL", ""):
-                                plate = ""
-
                             rule_map = {r["id"]: r for r in rules}
+                            effective_cat = "delivery" if (carrier in rule_map and face_role != "whitelist") else ev.category
+                            plate = _sanitize_plate(raw_plate, effective_cat)
+
+                            # Auto-purge routine school-backpack sidewalk walkers (and morning school departures exiting away
+                            # from the house) during weekday commute hours so they never bloat HDD storage or trigger alerts.
+                            if (
+                                ev.camera_id == "annke_1"
+                                and ev.category == "person"
+                                and carrier not in rule_map
+                                and face_role not in ("whitelist", "watchlist", "watchlist_auto")
+                                and (school_commuter or "backpack" in summary.lower())
+                                and ev.timestamp
+                            ):
+                                push_cfg_now = await get_push_config()
+                                away_now = bool(getattr(push_cfg_now, "away_mode", False)) and (
+                                    time.time() >= float(getattr(push_cfg_now, "away_armed_at", 0.0) or 0.0)
+                                )
+                                if not away_now:
+                                    dt_loc = ev.timestamp.astimezone(_LOCAL_TZ)
+                                    hm_loc = dt_loc.strftime("%H:%M")
+                                    in_school_win = dt_loc.weekday() < 5 and (
+                                        ("07:15" <= hm_loc <= "09:05") or ("14:10" <= hm_loc <= "16:35")
+                                    )
+                                    cx_ev = float(ev.bbox_x or 0.0) + float(ev.bbox_w or 0.0) * 0.5
+                                    fy_ev = float(ev.bbox_y or 0.0) + float(ev.bbox_h or 0.0) * 0.95
+                                    on_sidewalk_ev = (not in_tripwire) or (fy_ev <= (0.34 + max(0.0, cx_ev - 0.62) * 0.52))
+                                    exiting_ids: list[DetectionEvent] = []
+                                    is_exiting_school_departure = False
+                                    if in_school_win and not on_sidewalk_ev and ev.motion_slot:
+                                        sib_q = await session.execute(
+                                            select(DetectionEvent)
+                                            .where(
+                                                DetectionEvent.camera_id == "annke_1",
+                                                DetectionEvent.motion_slot == ev.motion_slot,
+                                                DetectionEvent.category == "person",
+                                                DetectionEvent.timestamp >= ev.timestamp - _td(seconds=8),
+                                                DetectionEvent.timestamp <= ev.timestamp + _td(seconds=4),
+                                            )
+                                            .order_by(DetectionEvent.timestamp.asc())
+                                        )
+                                        exiting_ids = list(sib_q.scalars().all())
+                                        if exiting_ids:
+                                            first_fy = float(exiting_ids[0].bbox_y or 0.0) + float(exiting_ids[0].bbox_h or 0.0) * 0.95
+                                            last_fy = float(exiting_ids[-1].bbox_y or 0.0) + float(exiting_ids[-1].bbox_h or 0.0) * 0.95
+                                            if first_fy >= 0.78 and (last_fy < first_fy - 0.06 or len(exiting_ids) == 1 and hm_loc <= "09:05"):
+                                                is_exiting_school_departure = True
+
+                                    if on_sidewalk_ev or is_exiting_school_departure:
+                                        if face_info and face_info.get("auto_enrolled") and str(face_info.get("name", "")).startswith("VISITOR_"):
+                                            await session.execute(delete(_KnownFace).where(_KnownFace.name == face_info["name"]))
+                                        rows_to_del = exiting_ids if is_exiting_school_departure else [ev]
+                                        for del_row in rows_to_del:
+                                            d_snap = (del_row.attributes or "").split("|")[0].strip()
+                                            await session.execute(delete(DetectionEvent).where(DetectionEvent.id == del_row.id))
+                                            if d_snap:
+                                                for fp in (
+                                                    f"{SNAPSHOT_DIR}/crop_{d_snap}",
+                                                    f"{SNAPSHOT_DIR}/full_{d_snap}",
+                                                    f"{SNAPSHOT_DIR}/plate_{d_snap}",
+                                                    f"{SNAPSHOT_DIR}/clip_{d_snap}.mp4",
+                                                ):
+                                                    if os.path.exists(fp):
+                                                        try:
+                                                            os.remove(fp)
+                                                        except OSError:
+                                                            pass
+                                        await session.commit()
+                                        return {"id": ev.id, "purged": True, "ai_notes": "Purged routine school-commute backpack walker"}
                             if carrier in rule_map and face_role != "whitelist":
                                 rule = rule_map[carrier]
                                 _record_delivery_sighting(carrier, _dt.now(_tz.utc).isoformat())

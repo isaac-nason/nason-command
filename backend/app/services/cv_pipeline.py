@@ -138,6 +138,23 @@ def is_within_time_window(now_hm: str, start_hm: str, end_hm: str) -> bool:
     return (start_hm <= now_hm <= end_hm) if start_hm <= end_hm else (now_hm >= start_hm or now_hm <= end_hm)
 
 
+# Empirical weekday school/sidewalk commute windows on annke_1 (America/Los_Angeles):
+# - Morning bell + Wednesday late-start: 07:20 - 08:55 PT (Mon-Fri)
+# - Afternoon early & main dismissal waves: 14:15 - 16:20 PT (Mon-Fri)
+ROUTINE_SIDEWALK_COMMUTE_WINDOWS: list[tuple[str, str]] = [
+    ("07:20", "08:55"),
+    ("14:15", "16:20"),
+]
+
+
+def is_routine_commute_window(dt_local: datetime | None = None) -> bool:
+    now_dt = dt_local or datetime.now(LOCAL_TZ)
+    if now_dt.weekday() >= 5:
+        return False
+    now_hm = now_dt.strftime("%H:%M")
+    return any(is_within_time_window(now_hm, s_hm, e_hm) for s_hm, e_hm in ROUTINE_SIDEWALK_COMMUTE_WINDOWS)
+
+
 def bbox_intersection_ratio(det: dict, motion_boxes: list[tuple[float, float, float, float]]) -> float:
     dx1, dy1, dx2, dy2 = det["x"], det["y"], det["x"] + det["w"], det["y"] + det["h"]
     det_area = max(0.0001, det["w"] * det["h"])
@@ -261,7 +278,15 @@ class TrueDisplacementTracker:
         self.last_valid_boxes: list[dict] = []
         self.last_valid_time: float = 0.0
 
-    def update(self, frame: np.ndarray, raw_detections: list[dict], motion_boxes: list, cam_zones: list) -> tuple[list[dict], list[dict]]:
+    def update(
+        self,
+        frame: np.ndarray,
+        raw_detections: list[dict],
+        motion_boxes: list,
+        cam_zones: list,
+        stream_name: str = "",
+        away_mode: bool = False,
+    ) -> tuple[list[dict], list[dict]]:
         now = time.time()
         self.tracks = {s: t for s, t in self.tracks.items() if now - t["last_seen"] < 25.0}
         self.spatial_cooldowns = [c for c in self.spatial_cooldowns if now - c["time"] < 60.0]
@@ -394,6 +419,19 @@ class TrueDisplacementTracker:
                 and recognized_role in ("whitelist", "watchlist", "watchlist_auto")
                 and tr.get("identity_logged") != recognized_name
             )
+            # Ignore routine public-sidewalk walkers (strictly outside TRIPWIRE_1) during Mon-Fri school commute windows
+            # so backpack/student sidewalk traffic writes zero snapshots/MP4s unless Away Mode or Watchlist is active.
+            if (
+                stream_name == "annke_1"
+                and not away_mode
+                and det["category"] == "person"
+                and not is_breach
+                and not is_watchlist
+                and recognized_role != "whitelist"
+                and is_routine_commute_window()
+            ):
+                continue
+
             already_logged = any(
                 c["category"] == det["category"] and math.hypot(tr["cx"] - c["cx"], tr["cy"] - c["cy"]) < 0.14 and (now - c["time"]) < 45.0
                 for c in self.spatial_cooldowns
@@ -614,7 +652,7 @@ class EdgeCVEngine:
             ]
             cam_zones = self.get_zones(stream_name)
             if not motion_boxes:
-                active_out, _ = tracker.update(frame, [], [], cam_zones)
+                active_out, _ = tracker.update(frame, [], [], cam_zones, stream_name=stream_name, away_mode=self.away_mode)
                 self.latest_detections[stream_name] = active_out
                 continue
 
@@ -634,7 +672,9 @@ class EdgeCVEngine:
                         d["sub_type"] = "cat"
             candidate_detections.sort(key=lambda d: d["area"], reverse=True)
 
-            active_out, db_events = tracker.update(frame, candidate_detections, motion_boxes, cam_zones)
+            active_out, db_events = tracker.update(
+                frame, candidate_detections, motion_boxes, cam_zones, stream_name=stream_name, away_mode=self.away_mode
+            )
             now_heat = time.time()
             if now_heat - self.last_heat_sample.get(stream_name, 0.0) >= 0.55:
                 sampled_any = False
