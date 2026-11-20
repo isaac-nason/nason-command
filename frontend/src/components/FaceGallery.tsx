@@ -1,5 +1,6 @@
 import { DeliveryRulesPanel } from './DeliveryRulesPanel';
-import React, { useEffect, useState } from 'react';
+import { ResidentVehiclesPanel } from './ResidentVehiclesPanel';
+import React, { useEffect, useMemo, useState } from 'react';
 import type { KnownFaceItem } from '../types/telemetry';
 import {
   AlertTriangle,
@@ -11,6 +12,7 @@ import {
   Edit3,
   ExternalLink,
   Globe,
+  Layers,
   Lock,
   Plus,
   RefreshCw,
@@ -24,6 +26,15 @@ import {
 
 interface FaceGalleryProps {
   hostIp: string;
+}
+
+interface GroupedFaceSubject {
+  groupKey: string;
+  name: string;
+  role: 'whitelist' | 'visitor' | 'watchlist';
+  vectors: KnownFaceItem[];
+  totalSightings: number;
+  latestSeen: string | null;
 }
 
 const PAGE_SIZE = 12;
@@ -46,6 +57,12 @@ const ROLE_STYLES: Record<string, { label: string; badge: string; border: string
   },
 };
 
+const ROLE_SORT_ORDER: Record<string, number> = {
+  whitelist: 0,
+  watchlist: 1,
+  visitor: 2,
+};
+
 export function FaceGallery({ hostIp }: FaceGalleryProps) {
   const apiBase = `http://${hostIp}:8080`;
   const [faces, setFaces] = useState<KnownFaceItem[]>([]);
@@ -55,6 +72,9 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [filterRole, setFilterRole] = useState<'all' | 'whitelist' | 'visitor' | 'watchlist'>('all');
   const [currentPage, setCurrentPage] = useState<number>(1);
+  const [selectedVecByGroup, setSelectedVecByGroup] = useState<Record<string, number>>({});
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editName, setEditName] = useState<string>('');
   const [editRole, setEditRole] = useState<'whitelist' | 'visitor' | 'watchlist'>('whitelist');
@@ -128,6 +148,7 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
       const res = await fetch(`${apiBase}/api/faces/${id}`, { method: 'DELETE' });
       if (res.ok) {
         setFaces(await res.json());
+        setConfirmDeleteId(null);
       }
     } catch (err) {
       console.error('Failed to delete face vector:', err);
@@ -158,7 +179,6 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
         if (res.ok) {
           setFaces(data);
           setImportStatus(`Enrolled ${importName.toUpperCase()} (${importRole.toUpperCase()})!`);
-          setImportName('');
         } else {
           setImportStatus(data.detail || 'No clear face found in photo.');
         }
@@ -214,17 +234,61 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
     window.open(urls[engine], '_blank', 'noopener,noreferrer');
   };
 
-  const filteredFaces = faces.filter((f) => (filterRole === 'all' ? true : f.role === filterRole));
-  const totalPages = Math.max(1, Math.ceil(filteredFaces.length / PAGE_SIZE));
-  const safePage = Math.min(currentPage, totalPages);
-  const pagedFaces = filteredFaces.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const allGroups = useMemo<GroupedFaceSubject[]>(() => {
+    const map = new Map<string, GroupedFaceSubject>();
+    for (const f of faces) {
+      const cleanName = (f.name || 'UNKNOWN').trim().toUpperCase();
+      const gKey = `${f.role}::${cleanName}`;
+      const existing = map.get(gKey);
+      if (!existing) {
+        map.set(gKey, {
+          groupKey: gKey,
+          name: cleanName,
+          role: f.role,
+          vectors: [f],
+          totalSightings: f.sightings || 0,
+          latestSeen: f.last_seen,
+        });
+      } else {
+        existing.vectors.push(f);
+        existing.totalSightings += f.sightings || 0;
+        if (f.last_seen && (!existing.latestSeen || f.last_seen > existing.latestSeen)) {
+          existing.latestSeen = f.last_seen;
+        }
+      }
+    }
 
-  const counts = {
-    all: faces.length,
-    whitelist: faces.filter((f) => f.role === 'whitelist').length,
-    visitor: faces.filter((f) => f.role === 'visitor').length,
-    watchlist: faces.filter((f) => f.role === 'watchlist').length,
-  };
+    const list = Array.from(map.values());
+    for (const grp of list) {
+      grp.vectors.sort((a, b) => {
+        const aUpload = (a.sample_crop || '').includes('upload_') ? 0 : 1;
+        const bUpload = (b.sample_crop || '').includes('upload_') ? 0 : 1;
+        if (aUpload !== bUpload) return aUpload - bUpload;
+        return b.id - a.id;
+      });
+    }
+
+    list.sort((a, b) => {
+      const ra = ROLE_SORT_ORDER[a.role] ?? 9;
+      const rb = ROLE_SORT_ORDER[b.role] ?? 9;
+      if (ra !== rb) return ra - rb;
+      if (a.role === 'whitelist' && b.vectors.length !== a.vectors.length) {
+        return b.vectors.length - a.vectors.length;
+      }
+      return (b.latestSeen || '').localeCompare(a.latestSeen || '');
+    });
+    return list;
+  }, [faces]);
+
+  const filteredGroups = allGroups.filter((g) => (filterRole === 'all' ? true : g.role === filterRole));
+  const totalPages = Math.max(1, Math.ceil(filteredGroups.length / PAGE_SIZE));
+  const safePage = Math.min(currentPage, totalPages);
+  const pagedGroups = filteredGroups.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  const wlGroups = allGroups.filter((g) => g.role === 'whitelist');
+  const wlVecCount = faces.filter((f) => f.role === 'whitelist').length;
+  const visGroups = allGroups.filter((g) => g.role === 'visitor');
+  const watchGroups = allGroups.filter((g) => g.role === 'watchlist');
 
   return (
     <div className="flex-1 flex flex-col gap-4 font-mono">
@@ -233,10 +297,10 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
           <Users className="w-5 h-5 text-emerald-400" />
           <div>
             <h2 className="text-xs sm:text-sm font-bold text-zinc-100 uppercase">
-              YUNET + SFACE BIOMETRIC GALLERY ({faces.length} SHOWN · {autoWatchlistCount} BG WATCHLIST)
+              YUNET + SFACE BIOMETRIC GALLERY ({allGroups.length} SUBJECTS · {faces.length} VECTORS · {autoWatchlistCount} BG WATCHLIST)
             </h2>
             <p className="text-[10px] text-zinc-400">
-              {syncMessage || 'Click SYNC WATCHLIST to paginate through unseen FBI & Oregon DOC fugitive pages'}
+              {syncMessage || 'Multi-angle vectors are grouped per person — enroll daylight, side-profile, and night angles for ~100% recall'}
             </p>
           </div>
         </div>
@@ -268,7 +332,7 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
         <div className="bg-zinc-950 border border-emerald-500/50 rounded-lg p-4 space-y-3">
           <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
             <span className="text-xs font-bold text-emerald-400 uppercase">
-              IMPORT FACE TO WHITELIST OR LOCAL WATCHLIST
+              IMPORT FACE ANGLE TO WHITELIST OR LOCAL WATCHLIST
             </span>
             <button onClick={() => setShowImportDrawer(false)} className="text-zinc-400 hover:text-white cursor-pointer">
               <X className="w-4 h-4" />
@@ -351,10 +415,10 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
           {[
-            { key: 'all', label: `ALL (${counts.all})` },
-            { key: 'whitelist', label: `🛡️ WHITELIST (${counts.whitelist})` },
-            { key: 'visitor', label: `👤 VISITORS (${counts.visitor})` },
-            { key: 'watchlist', label: `🚨 WATCHLIST (${counts.watchlist})` },
+            { key: 'all', label: `ALL (${allGroups.length})` },
+            { key: 'whitelist', label: `🛡️ WHITELIST (${wlGroups.length} · ${wlVecCount} ANGLES)` },
+            { key: 'visitor', label: `👤 VISITORS (${visGroups.length})` },
+            { key: 'watchlist', label: `🚨 WATCHLIST (${watchGroups.length})` },
           ].map((tab) => (
             <button
               key={tab.key}
@@ -408,21 +472,28 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
         </div>
       </div>
 
-      {pagedFaces.length === 0 ? (
+      {pagedGroups.length === 0 ? (
         <div className="grid items-start grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-          <DeliveryRulesPanel />
-          <div className="sm:col-span-1 lg:col-span-2 xl:col-span-3 bg-zinc-900/40 border border-zinc-800 rounded-lg py-16 px-4 text-center text-xs text-zinc-500">
-            No enrolled family or visitor face vectors yet. Use 👤 ID FACE or 🎓 TEACH in the Kill-Feed (or + ENROLL PHOTO above) to enroll ISAAC, JENNIFER, BEAU, or LYLA. ({autoWatchlistCount} background FBI/DOC vectors are armed in RAM).
+          <ResidentVehiclesPanel apiBase={apiBase} />
+          <DeliveryRulesPanel apiBase={apiBase} />
+          <div className="sm:col-span-2 lg:col-span-3 xl:col-span-4 bg-zinc-900/40 border border-zinc-800 rounded-lg py-16 px-4 text-center text-xs text-zinc-500">
+            No enrolled family or visitor face vectors in this filter yet. Use 👤 ID FACE or 🎓 TEACH in the Kill-Feed (or + ENROLL PHOTO above) to enroll family portraits. ({autoWatchlistCount} background FBI/DOC vectors are armed in RAM).
           </div>
         </div>
       ) : (
         <div className="grid items-start grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-          <DeliveryRulesPanel />
-          {pagedFaces.map((face) => {
-            const style = ROLE_STYLES[face.role] || ROLE_STYLES.whitelist;
-            const isWhitelisted = face.role === 'whitelist';
-            const lastSeenStr = face.last_seen
-              ? new Date(face.last_seen).toLocaleString([], {
+          <ResidentVehiclesPanel apiBase={apiBase} />
+          <DeliveryRulesPanel apiBase={apiBase} />
+
+          {pagedGroups.map((grp) => {
+            const style = ROLE_STYLES[grp.role] || ROLE_STYLES.whitelist;
+            const isWhitelisted = grp.role === 'whitelist';
+            const selId = selectedVecByGroup[grp.groupKey];
+            const activeFace = grp.vectors.find((v) => v.id === selId) || grp.vectors[0];
+            const angleCount = grp.vectors.length;
+
+            const lastSeenStr = grp.latestSeen
+              ? new Date(grp.latestSeen).toLocaleString([], {
                   month: 'short',
                   day: 'numeric',
                   hour: '2-digit',
@@ -432,34 +503,51 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
 
             return (
               <div
-                key={face.id}
+                key={grp.groupKey}
                 className={`bg-zinc-950 border rounded-lg p-3 flex flex-col justify-between gap-3 ${style.border}`}
               >
                 <div className="flex gap-3 items-start">
-                  <div className="w-20 h-20 rounded-md overflow-hidden bg-zinc-900 border border-zinc-800 shrink-0 flex items-center justify-center">
-                    {face.sample_crop ? (
+                  <div className="w-20 h-20 rounded-md overflow-hidden bg-zinc-900 border border-zinc-800 shrink-0 flex items-center justify-center relative">
+                    {activeFace.sample_crop ? (
                       <img
-                        src={`${apiBase}${face.sample_crop}`}
-                        alt={face.name}
+                        src={`${apiBase}${activeFace.sample_crop}`}
+                        alt={grp.name}
                         className="w-full h-full object-cover"
                       />
                     ) : (
                       <UserCheck className="w-7 h-7 text-zinc-700" />
                     )}
+                    <span className="absolute bottom-0.5 right-0.5 bg-black/80 text-zinc-200 text-[8px] px-1 rounded">
+                      #{activeFace.id}
+                    </span>
                   </div>
 
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between gap-1">
+                    <div className="flex items-center justify-between gap-1 flex-wrap">
                       <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${style.badge}`}>
                         {style.label}
                       </span>
-                      <span className="text-[10px] text-zinc-500">#{face.id}</span>
+                      {isWhitelisted && (
+                        <span
+                          className={`text-[9px] font-bold px-1.5 py-0.5 rounded border flex items-center gap-0.5 ${
+                            angleCount >= 3
+                              ? 'bg-emerald-950/90 text-emerald-300 border-emerald-500/40'
+                              : angleCount === 2
+                              ? 'bg-sky-950/90 text-sky-300 border-sky-500/40'
+                              : 'bg-amber-950/90 text-amber-300 border-amber-500/40'
+                          }`}
+                          title="Enrolled 128-D angle vectors for this person"
+                        >
+                          <Layers className="w-2.5 h-2.5" />
+                          {angleCount} {angleCount === 1 ? 'ANGLE' : 'ANGLES'}
+                        </span>
+                      )}
                     </div>
 
-                    <div className="text-sm font-bold text-zinc-100 truncate mt-1.5">{face.name}</div>
+                    <div className="text-sm font-bold text-zinc-100 truncate mt-1.5">{grp.name}</div>
 
                     <div className="text-[11px] text-emerald-400 font-semibold mt-0.5">
-                      Seen {face.sightings} {face.sightings === 1 ? 'time' : 'times'}
+                      Seen {grp.totalSightings} {grp.totalSightings === 1 ? 'time' : 'times'}
                     </div>
                     <div className="text-[10px] text-zinc-500 flex items-center gap-1 mt-0.5">
                       <Clock className="w-3 h-3" />
@@ -468,8 +556,77 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
                   </div>
                 </div>
 
-                {editingId === face.id ? (
+                {/* Multi-Angle Thumbnail Selector Strip */}
+                {(angleCount > 1 || isWhitelisted) && (
+                  <div className="pt-2 border-t border-zinc-900 space-y-1.5">
+                    <div className="flex items-center justify-between text-[9px] text-zinc-400">
+                      <span>
+                        {angleCount === 1
+                          ? '1 vector enrolled — add side/night angle:'
+                          : `Select angle (${angleCount} enrolled vectors):`}
+                      </span>
+                      {(isWhitelisted || grp.role === 'watchlist') && (
+                        <button
+                          onClick={() => {
+                            setImportName(grp.name);
+                            setImportRole(grp.role === 'watchlist' ? 'watchlist' : 'whitelist');
+                            setShowImportDrawer(true);
+                            setImportStatus(`Ready to upload a new angle for ${grp.name}`);
+                            window.scrollTo({ top: 0, behavior: 'smooth' });
+                          }}
+                          className="text-emerald-300 hover:text-emerald-200 font-bold flex items-center gap-0.5 cursor-pointer"
+                          title={`Upload another photo angle for ${grp.name}`}
+                        >
+                          <Plus className="w-2.5 h-2.5" />
+                          ADD ANGLE
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
+                      {grp.vectors.map((vec) => {
+                        const isSelected = vec.id === activeFace.id;
+                        const isUpload = (vec.sample_crop || '').includes('upload_');
+                        return (
+                          <button
+                            key={vec.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedVecByGroup((prev) => ({ ...prev, [grp.groupKey]: vec.id }));
+                              setConfirmDeleteId(null);
+                            }}
+                            title={`Vector #${vec.id} (${isUpload ? 'Uploaded Reference' : 'Camera Capture'} · Seen ${vec.sightings}x)`}
+                            className={`relative w-10 h-10 rounded overflow-hidden shrink-0 border transition-all cursor-pointer ${
+                              isSelected
+                                ? 'border-emerald-400 ring-1 ring-emerald-400 scale-105'
+                                : 'border-zinc-800 opacity-70 hover:opacity-100'
+                            }`}
+                          >
+                            {vec.sample_crop ? (
+                              <img
+                                src={`${apiBase}${vec.sample_crop}`}
+                                alt={`#${vec.id}`}
+                                className="w-full h-full object-cover"
+                              />
+                            ) : (
+                              <UserCheck className="w-4 h-4 text-zinc-600 m-auto" />
+                            )}
+                            <span
+                              className={`absolute bottom-0 inset-x-0 text-[7px] font-bold text-center leading-tight ${
+                                isUpload ? 'bg-sky-950/90 text-sky-200' : 'bg-zinc-950/90 text-amber-200'
+                              }`}
+                            >
+                              {isUpload ? 'REF' : 'CAM'}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {editingId === activeFace.id ? (
                   <div className="bg-zinc-900 border border-zinc-700 rounded p-2 space-y-2">
+                    <div className="text-[9px] text-zinc-400">Editing vector #{activeFace.id}:</div>
                     <input
                       type="text"
                       value={editName}
@@ -500,7 +657,7 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
                         CANCEL
                       </button>
                       <button
-                        onClick={() => handleSaveEdit(face.id)}
+                        onClick={() => handleSaveEdit(activeFace.id)}
                         className="px-2.5 py-1 rounded text-[10px] font-bold bg-emerald-600 text-white flex items-center gap-1 cursor-pointer"
                       >
                         <Check className="w-3 h-3" />
@@ -511,11 +668,11 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
                 ) : (
                   <div className="space-y-2 pt-2 border-t border-zinc-900">
                     <div className="flex items-center justify-between gap-1">
-                      {face.sample_crop && (
+                      {activeFace.sample_crop && (
                         <a
-                          href={`${apiBase}${face.sample_crop}`}
-                          download={`face_${face.name}.jpg`}
-                          title="Download aligned face crop locally"
+                          href={`${apiBase}${activeFace.sample_crop}`}
+                          download={`face_${grp.name}_${activeFace.id}.jpg`}
+                          title={`Download crop #${activeFace.id} locally`}
                           className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 px-2 py-1 rounded text-[10px] text-zinc-300 flex items-center gap-1"
                         >
                           <Download className="w-3 h-3 text-emerald-400" />
@@ -524,7 +681,7 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
                       )}
                       <button
                         disabled={isWhitelisted}
-                        onClick={() => !isWhitelisted && launchOsintLookup(face.sample_crop, 'pimeyes')}
+                        onClick={() => !isWhitelisted && launchOsintLookup(activeFace.sample_crop, 'pimeyes')}
                         title={
                           isWhitelisted
                             ? 'OpSec Lock: External OSINT disabled for Whitelisted family members'
@@ -538,7 +695,7 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
                       </button>
                       <button
                         disabled={isWhitelisted}
-                        onClick={() => !isWhitelisted && launchOsintLookup(face.sample_crop, 'yandex')}
+                        onClick={() => !isWhitelisted && launchOsintLookup(activeFace.sample_crop, 'yandex')}
                         title={
                           isWhitelisted
                             ? 'OpSec Lock: External OSINT disabled for Whitelisted family members'
@@ -555,23 +712,47 @@ export function FaceGallery({ hostIp }: FaceGalleryProps) {
                     <div className="flex items-center justify-between gap-1.5">
                       <button
                         onClick={() => {
-                          setEditingId(face.id);
-                          setEditName(face.name);
-                          setEditRole(face.role);
+                          setEditingId(activeFace.id);
+                          setEditName(activeFace.name);
+                          setEditRole(activeFace.role);
                         }}
                         className="flex-1 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1 rounded text-[10px] text-zinc-200 flex items-center justify-center gap-1 cursor-pointer"
                       >
                         <Edit3 className="w-3 h-3" />
-                        RENAME / ROLE
+                        RENAME #{activeFace.id}
                       </button>
-                      <button
-                        onClick={() => handleDeleteFace(face.id)}
-                        title="Delete this specific 128-D face vector"
-                        className="bg-red-950/70 hover:bg-red-900 border border-red-500/40 px-2.5 py-1 rounded text-[10px] text-red-300 flex items-center gap-1 cursor-pointer"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                        DELETE
-                      </button>
+
+                      {confirmDeleteId === activeFace.id ? (
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => handleDeleteFace(activeFace.id)}
+                            className="bg-red-600 hover:bg-red-500 border border-red-400 px-2 py-1 rounded text-[10px] font-bold text-white cursor-pointer"
+                          >
+                            DEL #{activeFace.id}?
+                          </button>
+                          <button
+                            onClick={() => setConfirmDeleteId(null)}
+                            className="bg-zinc-800 hover:bg-zinc-700 px-1.5 py-1 rounded text-[10px] text-zinc-300 cursor-pointer"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => {
+                            if (grp.role === 'visitor') {
+                              handleDeleteFace(activeFace.id);
+                            } else {
+                              setConfirmDeleteId(activeFace.id);
+                            }
+                          }}
+                          title={`Delete angle vector #${activeFace.id}`}
+                          className="bg-red-950/70 hover:bg-red-900 border border-red-500/40 px-2.5 py-1 rounded text-[10px] text-red-300 flex items-center gap-1 cursor-pointer"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          DEL #{activeFace.id}
+                        </button>
+                      )}
                     </div>
                   </div>
                 )}

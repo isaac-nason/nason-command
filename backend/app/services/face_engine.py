@@ -43,6 +43,18 @@ VERIFIED_CLEAN_CROPS = {
 }
 
 
+def _load_local_verified_crops() -> set[str]:
+    cfg_path = os.path.join(FACE_CROPS_DIR, "verified_crops.json")
+    if not os.path.exists(cfg_path):
+        return set()
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            items = json.load(f)
+        return {str(x).strip() for x in items if str(x).strip()} if isinstance(items, list) else set()
+    except Exception:
+        return set()
+
+
 class BiometricFaceEngine:
     def __init__(self):
         self.lock = threading.Lock()
@@ -411,13 +423,14 @@ class BiometricFaceEngine:
             if img is not None and img.size > 0:
                 query_vec, _, _ = self.extract_person_crop_face(img, for_enrollment=False)
 
+        verified_crops = VERIFIED_CLEAN_CROPS | _load_local_verified_crops()
         removed = 0
         async with AsyncSessionLocal() as session:
             res = await session.execute(select(KnownFace).where(KnownFace.name == target_upper))
             rows = res.scalars().all()
             for r in rows:
                 bname = os.path.basename(r.sample_crop or "")
-                if bname.startswith("upload_") or bname in VERIFIED_CLEAN_CROPS:
+                if bname.startswith("upload_") or bname in verified_crops:
                     continue
                 should_drop = bname in KNOWN_POISONED_CROPS or target_upper.startswith("VISITOR_")
                 if not should_drop and query_vec is not None:
@@ -473,6 +486,7 @@ class BiometricFaceEngine:
         purged_db = 0
         purged_names: list[str] = []
         surviving_files: set[str] = set()
+        verified_crops = VERIFIED_CLEAN_CROPS | _load_local_verified_crops()
 
         async with AsyncSessionLocal() as session:
             res = await session.execute(select(KnownFace))
@@ -483,7 +497,11 @@ class BiometricFaceEngine:
                     continue
 
                 bname = os.path.basename(r.sample_crop or "")
-                if bname in VERIFIED_CLEAN_CROPS or bname.startswith("upload_"):
+                if (
+                    bname in verified_crops
+                    or bname.startswith("upload_")
+                    or (role == "whitelist" and bname.startswith("face_VISITOR_"))
+                ):
                     surviving_files.add(bname)
                     continue
 
@@ -534,7 +552,7 @@ class BiometricFaceEngine:
         for fname in os.listdir(FACE_CROPS_DIR):
             if not fname.endswith(".jpg"):
                 continue
-            if fname in surviving_files or fname in VERIFIED_CLEAN_CROPS or fname.startswith("upload_"):
+            if fname in surviving_files or fname in verified_crops or fname.startswith("upload_"):
                 continue
             if fname in KNOWN_POISONED_CROPS or fname.startswith(("enrolled_", "face_VISITOR_")):
                 try:

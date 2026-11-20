@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import type { PersistedDetectionEvent } from '../types/telemetry';
+import type { PersistedDetectionEvent, ResidentVehicleItem } from '../types/telemetry';
 import {
   BookOpen,
   Camera,
@@ -66,6 +66,36 @@ const TEACH_PRESETS: Record<string, { label: string; value: string }[]> = {
   ],
 };
 
+function formatCardTimestamp(iso: string): string {
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return iso;
+  const now = new Date();
+  const timePart = dt.toLocaleTimeString([], {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+
+  const sameDay =
+    dt.getFullYear() === now.getFullYear() &&
+    dt.getMonth() === now.getMonth() &&
+    dt.getDate() === now.getDate();
+  if (sameDay) return `TODAY ${timePart}`;
+
+  const yest = new Date(now);
+  yest.setDate(now.getDate() - 1);
+  const isYesterday =
+    dt.getFullYear() === yest.getFullYear() &&
+    dt.getMonth() === yest.getMonth() &&
+    dt.getDate() === yest.getDate();
+  if (isYesterday) return `YEST ${timePart}`;
+
+  const datePart = dt.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  const shortTime = dt.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit' });
+  return `${datePart} · ${shortTime}`;
+}
+
 export function EvidenceRail({
   hostIp,
   refreshTrigger = 0,
@@ -87,7 +117,18 @@ export function EvidenceRail({
   const [teachCategory, setTeachCategory] = useState<string>('animal');
   const [teachSubType, setTeachSubType] = useState<string>('cat');
   const [teachStatus, setTeachStatus] = useState<string | null>(null);
+  const [confirmPurgeAll, setConfirmPurgeAll] = useState<boolean>(false);
+  const [residentVehicles, setResidentVehicles] = useState<ResidentVehicleItem[]>([]);
   const apiBase = `http://${hostIp}:8080`;
+
+  useEffect(() => {
+    fetch(`${apiBase}/api/resident-vehicles`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.vehicles) setResidentVehicles(d.vehicles);
+      })
+      .catch(() => {});
+  }, [apiBase, refreshTrigger]);
 
   const fetchEvents = async () => {
     try {
@@ -114,9 +155,23 @@ export function EvidenceRail({
       if (res.ok) {
         setEvents([]);
         setSelectedEvent(null);
+        setConfirmPurgeAll(false);
       }
     } catch (err) {
       console.error('Failed to purge detections:', err);
+    }
+  };
+
+  const handleDeleteSingle = async (e: React.MouseEvent, evId: number) => {
+    e.stopPropagation();
+    setEvents((prev) => prev.filter((item) => item.id !== evId));
+    if (selectedEvent && selectedEvent.id === evId) {
+      setSelectedEvent(null);
+    }
+    try {
+      await fetch(`${apiBase}/api/detections/${evId}`, { method: 'DELETE' });
+    } catch (err) {
+      console.error('Failed to delete single detection:', err);
     }
   };
 
@@ -266,9 +321,21 @@ export function EvidenceRail({
 
   const isSelectedWhitelisted =
     selectedEvent !== null &&
-    (selectedEvent.sub_type || '').startsWith('ID:') &&
-    !(selectedEvent.sub_type || '').includes('VISITOR_') &&
-    !(selectedEvent.sub_type || '').includes('WATCHLIST');
+    (((selectedEvent.sub_type || '').startsWith('ID:') &&
+      !(selectedEvent.sub_type || '').includes('VISITOR_') &&
+      !(selectedEvent.sub_type || '').includes('WATCHLIST')) ||
+      (selectedEvent.sub_type || '').startsWith('🏠'));
+
+  const activeTeachPresets =
+    teachCategory === 'vehicle'
+      ? [
+          ...residentVehicles.map((v) => ({
+            label: `🏠 ${v.owner}'S ${v.vehicle_label}${v.plate ? ` [${v.plate}]` : ''}`,
+            value: `RESIDENT:${v.id}`,
+          })),
+          ...TEACH_PRESETS.vehicle,
+        ]
+      : TEACH_PRESETS[teachCategory] || TEACH_PRESETS.animal;
 
   return (
     <>
@@ -309,15 +376,33 @@ export function EvidenceRail({
                 {lim === 600 ? 'ALL' : lim}
               </button>
             ))}
-            {events.length > 0 && (
-              <button
-                onClick={handlePurgeAll}
-                title="Wipe snapshots & clips (Face IDs are preserved)"
-                className="text-[10px] font-mono bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-500/40 px-1.5 py-0.5 rounded flex items-center gap-0.5 cursor-pointer"
-              >
-                <Trash2 className="w-3 h-3" />
-              </button>
-            )}
+            {events.length > 0 &&
+              (confirmPurgeAll ? (
+                <div className="flex items-center gap-0.5">
+                  <button
+                    onClick={handlePurgeAll}
+                    title="Confirm wiping ALL snapshots & detection events"
+                    className="text-[9px] font-mono font-bold bg-red-600 hover:bg-red-500 text-white border border-red-300 px-1.5 py-0.5 rounded cursor-pointer"
+                  >
+                    WIPE ALL?
+                  </button>
+                  <button
+                    onClick={() => setConfirmPurgeAll(false)}
+                    title="Cancel wipe"
+                    className="text-[9px] font-mono bg-zinc-800 hover:bg-zinc-700 text-zinc-300 px-1 py-0.5 rounded cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmPurgeAll(true)}
+                  title="Wipe ALL snapshots & clips (requires confirmation; Face IDs are preserved)"
+                  className="text-[10px] font-mono bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-500/40 px-1.5 py-0.5 rounded flex items-center gap-0.5 cursor-pointer"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              ))}
           </div>
         </div>
       <div className="px-2.5 py-1.5 border-b border-zinc-800/80 bg-zinc-950/60 flex items-center gap-1 overflow-x-auto">
@@ -343,21 +428,21 @@ export function EvidenceRail({
             </div>
           ) : (
             events.filter((e) => catFilter === 'ALL' || e.category === catFilter).map((ev) => {
-              const isRecognizedFace = (ev.sub_type || '').startsWith('ID:');
-              const isWatchlist = (ev.sub_type || '').includes('WATCHLIST');
+              const sub = ev.sub_type || '';
+              const isWatchlist = sub.includes('WATCHLIST');
+              const isVisitorFace = sub.startsWith('ID:') && sub.includes('VISITOR_');
+              const isTrustedHousehold =
+                (sub.startsWith('ID:') && !isVisitorFace && !isWatchlist) || sub.startsWith('🏠');
               const badge = isWatchlist
                 ? 'bg-red-600 text-white border-red-300'
-                : isRecognizedFace
+                : isTrustedHousehold
                 ? 'bg-emerald-950 text-emerald-300 border-emerald-400/60'
+                : isVisitorFace
+                ? 'bg-amber-950 text-amber-300 border-amber-400/60'
                 : BADGE_COLORS[ev.category] || BADGE_COLORS.vehicle;
-              const isBreach = ev.full_label.includes('BREACH') || isWatchlist;
+              const isBreach = (ev.full_label.includes('BREACH') && !isTrustedHousehold) || isWatchlist;
               const friendlyCam = CAM_NAMES[ev.camera_id] || ev.camera_id.toUpperCase();
-              const timeStr = new Date(ev.timestamp).toLocaleTimeString([], {
-                hour12: false,
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-              });
+              const timeStr = formatCardTimestamp(ev.timestamp);
 
               return (
                 <div
@@ -369,8 +454,10 @@ export function EvidenceRail({
                   className={`group rounded p-2 flex flex-col gap-2 cursor-pointer transition-all border ${
                     isBreach
                       ? 'bg-red-950/35 hover:bg-red-950/50 border-red-500 shadow-[0_0_15px_rgba(239,68,68,0.25)]'
-                      : isRecognizedFace
+                      : isTrustedHousehold
                       ? 'bg-emerald-950/25 hover:bg-emerald-950/40 border-emerald-500/60'
+                      : isVisitorFace
+                      ? 'bg-amber-950/20 hover:bg-amber-950/35 border-amber-500/45'
                       : 'bg-zinc-950/90 hover:bg-zinc-900 border-zinc-800 hover:border-zinc-600'
                   }`}
                 >
@@ -455,6 +542,13 @@ export function EvidenceRail({
                             >
                               🎓 TEACH
                             </button>
+                          <button
+                            onClick={(e) => handleDeleteSingle(e, ev.id)}
+                            title="Delete this event & snapshot files"
+                            className="p-1 rounded text-[10px] font-mono bg-zinc-900/90 hover:bg-red-950 text-zinc-400 hover:text-red-300 border border-zinc-700/70 hover:border-red-500/50 flex items-center cursor-pointer"
+                          >
+                            <Trash2 className="w-2.5 h-2.5" />
+                          </button>
                         </div>
                       </div>
                     </div>
@@ -505,12 +599,16 @@ export function EvidenceRail({
                   </div>
 
                   <div className="grid grid-cols-2 gap-1.5">
-                    {(TEACH_PRESETS[teachCategory] || TEACH_PRESETS.animal).map((preset) => (
+                    {activeTeachPresets.map((preset) => (
                       <button
                         key={preset.value}
                         type="button"
                         onClick={() => submitTeachCorrection(ev.id, teachCategory, preset.value)}
-                        className="px-2 py-1.5 rounded bg-zinc-900 hover:bg-amber-500 hover:text-black text-zinc-100 border border-zinc-700 hover:border-amber-300 font-mono font-bold text-[10px] cursor-pointer text-left truncate transition-colors"
+                        className={`px-2 py-1.5 rounded hover:bg-amber-500 hover:text-black border hover:border-amber-300 font-mono font-bold text-[10px] cursor-pointer text-left truncate transition-colors ${
+                          preset.value.startsWith('RESIDENT:')
+                            ? 'col-span-2 bg-emerald-950/70 text-emerald-200 border-emerald-500/50'
+                            : 'bg-zinc-900 text-zinc-100 border-zinc-700'
+                        }`}
                       >
                         {preset.label}
                       </button>
@@ -597,6 +695,8 @@ export function EvidenceRail({
                       className={`rounded px-2 py-1.5 text-[10px] font-mono leading-relaxed border ${
                         isBreach
                           ? 'bg-red-950/60 border-red-500/40 text-red-200'
+                          : isVisitorFace
+                          ? 'bg-amber-950/35 border-amber-500/35 text-amber-200'
                           : 'bg-emerald-950/30 border-emerald-500/30 text-emerald-200'
                       }`}
                     >
@@ -631,6 +731,18 @@ export function EvidenceRail({
               <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
                 <span className="text-xs font-bold text-emerald-400 uppercase">
                   EVENT #{selectedEvent.id}
+                </span>
+                <span className="text-[11px] text-zinc-400 flex items-center gap-1">
+                  <Clock className="w-3 h-3 text-emerald-400" />
+                  {new Date(selectedEvent.timestamp).toLocaleString([], {
+                    month: 'short',
+                    day: 'numeric',
+                    year: 'numeric',
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                  })}
                 </span>
                 <span className="text-xs text-zinc-200 font-bold">
                   {CAM_NAMES[selectedEvent.camera_id] || selectedEvent.camera_id} // {selectedEvent.sub_type || selectedEvent.full_label}
@@ -720,6 +832,14 @@ export function EvidenceRail({
                 >
                   <Cpu className="w-3 h-3" />
                   {inspectingId === selectedEvent.id ? 'SCANNING...' : 'INSPECT'}
+                </button>
+                <button
+                  onClick={(e) => handleDeleteSingle(e, selectedEvent.id)}
+                  title="Delete this event & snapshot files"
+                  className="px-2 py-1 rounded text-[11px] font-mono font-bold bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-500/40 flex items-center gap-1 cursor-pointer"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  DELETE
                 </button>
                 <button
                   onClick={() => setSelectedEvent(null)}

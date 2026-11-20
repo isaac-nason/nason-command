@@ -984,6 +984,12 @@ async def health_and_sitrep_worker(cv_engine: EdgeCVEngine):
     while True:
         try:
             now = time.time()
+            action_queue_file = os.path.join(BACKUP_DIR, "reviewed_action_queue.json")
+            if os.path.exists(action_queue_file):
+                from app.main import drain_reviewed_action_queue
+
+                await drain_reviewed_action_queue()
+
             cfg = await get_push_config()
             cv_engine.set_away_and_mute_state(
                 cfg.away_mode,

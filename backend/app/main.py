@@ -123,6 +123,11 @@ class AgentCommandDTO(BaseModel):
     prompt: str
 
 
+class BulkDeleteDetectionsDTO(BaseModel):
+    ids: list[int] = []
+    snap_ids: list[str] = []
+
+
 async def sync_zones_to_engine(cv_engine: EdgeCVEngine):
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(CameraZone))
@@ -386,12 +391,270 @@ async def purge_perimeter_breach_events() -> dict:
     return {"purged_events": purged_rows, "removed_files": removed_files}
 
 
+async def delete_detection_events(
+    ids: list[int] | None = None,
+    snap_ids: list[str] | None = None,
+) -> dict:
+    """
+    Surgically deletes reviewed unnecessary DetectionEvent rows and their associated
+    crop/full/plate/MP4 files on HDD, plus any orphaned 1-sighting VISITOR_XX ghosts.
+    """
+    target_ids: set[int] = set()
+    for raw_id in ids or []:
+        try:
+            iv = int(raw_id)
+            if iv > 0:
+                target_ids.add(iv)
+        except (TypeError, ValueError):
+            pass
+
+    target_snaps: set[str] = set()
+    for raw_s in snap_ids or []:
+        s = str(raw_s or "").strip()
+        if s and os.path.basename(s) == s and s.endswith(".jpg"):
+            target_snaps.add(s)
+
+    if not target_ids and not target_snaps:
+        return {"status": "NOOP", "deleted_events": 0, "removed_files": 0, "freed_mb": 0.0}
+
+    deleted_rows = 0
+    removed_files = 0
+    freed_bytes = 0
+    purged_visitor_tokens: set[str] = set()
+    collected_snaps: set[str] = set(target_snaps)
+
+    async with AsyncSessionLocal() as session:
+        matched_rows: dict[int, DetectionEvent] = {}
+        if target_ids:
+            res_ids = await session.execute(
+                select(DetectionEvent).where(DetectionEvent.id.in_(sorted(target_ids)))
+            )
+            for r in res_ids.scalars().all():
+                matched_rows[r.id] = r
+
+        if target_snaps:
+            for sid in target_snaps:
+                res_s = await session.execute(
+                    select(DetectionEvent).where(DetectionEvent.attributes.like(f"{sid}%"))
+                )
+                for r in res_s.scalars().all():
+                    row_sid = (r.attributes or "").split("|")[0].strip()
+                    if row_sid == sid:
+                        matched_rows[r.id] = r
+
+        for ev_id, r in matched_rows.items():
+            row_sid = (r.attributes or "").split("|")[0].strip()
+            if row_sid and os.path.basename(row_sid) == row_sid and row_sid.endswith(".jpg"):
+                collected_snaps.add(row_sid)
+            for tok in (r.sub_type or "").replace("(", " ").replace(")", " ").split():
+                if tok.startswith("VISITOR_"):
+                    purged_visitor_tokens.add(tok)
+            await session.execute(delete(DetectionEvent).where(DetectionEvent.id == ev_id))
+            deleted_rows += 1
+
+        if deleted_rows:
+            await session.commit()
+
+        if purged_visitor_tokens:
+            rem_res = await session.execute(
+                select(DetectionEvent.sub_type, DetectionEvent.ai_notes).where(
+                    DetectionEvent.category == "person"
+                )
+            )
+            rem_blob = "\n".join(f"{st or ''} {nt or ''}" for st, nt in rem_res.all())
+            removed_visitors = 0
+            for vtok in purged_visitor_tokens:
+                if vtok not in rem_blob:
+                    vf_res = await session.execute(
+                        select(KnownFace).where(
+                            KnownFace.name == vtok,
+                            KnownFace.role == "visitor",
+                            KnownFace.sightings <= 1,
+                        )
+                    )
+                    for vf in vf_res.scalars().all():
+                        if vf.sample_crop and str(vf.sample_crop).startswith("/face_crops/"):
+                            disk_crop = f"{FACE_CROPS_DIR}/{os.path.basename(vf.sample_crop)}"
+                            if os.path.exists(disk_crop):
+                                try:
+                                    os.remove(disk_crop)
+                                except OSError:
+                                    pass
+                        await session.execute(delete(KnownFace).where(KnownFace.id == vf.id))
+                        removed_visitors += 1
+            if removed_visitors:
+                await session.commit()
+                await face_engine.sync_gallery_from_db_and_disk()
+
+    for sid in collected_snaps:
+        for fp in (
+            f"{SNAPSHOT_DIR}/crop_{sid}",
+            f"{SNAPSHOT_DIR}/full_{sid}",
+            f"{SNAPSHOT_DIR}/plate_{sid}",
+            f"{SNAPSHOT_DIR}/clip_{sid}.mp4",
+        ):
+            if os.path.exists(fp):
+                try:
+                    freed_bytes += os.path.getsize(fp)
+                    os.remove(fp)
+                    removed_files += 1
+                except OSError:
+                    pass
+
+    freed_mb = round(freed_bytes / 1048576.0, 2)
+    if deleted_rows or removed_files:
+        print(
+            f"[DETECTION CLEANUP] Deleted {deleted_rows} reviewed event(s) and "
+            f"{removed_files} snapshot/clip file(s) (freed {freed_mb} MB)."
+        )
+    return {
+        "status": "DELETED",
+        "deleted_events": deleted_rows,
+        "removed_files": removed_files,
+        "freed_mb": freed_mb,
+    }
+
+
+async def reconcile_resident_vehicle_events() -> int:
+    """
+    Reconciles historical driveway vehicle events that match git-ignored
+    /tmp/command_faces/resident_vehicles.json (by OCR plate/alias or verified_snap_ids).
+    """
+    from app.agent.orchestrator import _load_resident_vehicles, _match_resident_vehicle
+
+    vehicles = _load_resident_vehicles()
+    if not vehicles:
+        return 0
+
+    snap_to_rv: dict[str, dict] = {}
+    for rv in vehicles:
+        for vs in rv.get("verified_snap_ids") or []:
+            s = str(vs or "").strip()
+            if s:
+                snap_to_rv[s] = rv
+
+    updated = 0
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            select(DetectionEvent).where(DetectionEvent.category == "vehicle")
+        )
+        for ev in res.scalars().all():
+            snap_id = (ev.attributes or "").split("|")[0].strip()
+            matched_rv = snap_to_rv.get(snap_id)
+            if not matched_rv:
+                text_blob = f"{ev.sub_type or ''} {ev.ai_notes or ''}"
+                if "[PLATE:" in text_blob.upper():
+                    raw_p = text_blob.upper().split("[PLATE:", 1)[1].split("]", 1)[0].strip()
+                    matched_rv = _match_resident_vehicle(raw_p, ev.sub_type or "", ev.ai_notes or "")
+            if not matched_rv:
+                continue
+
+            owner = str(matched_rv.get("owner") or "RESIDENT").strip().upper()
+            veh_lbl = str(matched_rv.get("vehicle_label") or "VEHICLE").strip().upper()
+            canon_plate = str(matched_rv.get("plate") or "").strip().upper()
+            new_sub = f"🏠 {owner}'S {veh_lbl}" + (f" [PLATE: {canon_plate}]" if canon_plate else "")
+            slot = ev.motion_slot or "Motion_1"
+            new_full = f"{slot}_{owner}_{canon_plate or 'VEHICLE'}"
+            if ev.sub_type != new_sub or "BREACH" in (ev.full_label or ""):
+                ev.sub_type = new_sub[:115]
+                ev.full_label = new_full[:150]
+                old_note = (ev.ai_notes or "").replace("🚨 [BREACH] ", "").strip()
+                prefix = f"🏠 [RESIDENT VEHICLE: {owner} // {canon_plate}] "
+                if not old_note.startswith("🏠 [RESIDENT VEHICLE"):
+                    old_note = prefix + old_note
+                ev.ai_notes = old_note
+                ev.attributes = f"{snap_id}|{old_note}"[:250] if snap_id else old_note[:250]
+                updated += 1
+        if updated:
+            await session.commit()
+            print(f"[RESIDENT VEHICLES] Reconciled {updated} household vehicle event(s).")
+    return updated
+
+
+REVIEWED_ACTION_QUEUE_PATH = "/tmp/command_backups/reviewed_action_queue.json"
+REVIEWED_ACTION_RECEIPT_PATH = "/tmp/command_backups/reviewed_action_receipt.json"
+
+
+async def drain_reviewed_action_queue() -> dict | None:
+    """
+    Drains post-review actions queued at /tmp/command_backups/reviewed_action_queue.json
+    (enrolling verified family crops BEFORE deleting reviewed unnecessary snapshots).
+    """
+    if not os.path.exists(REVIEWED_ACTION_QUEUE_PATH):
+        return None
+
+    proc_path = f"{REVIEWED_ACTION_QUEUE_PATH}.processing"
+    try:
+        os.replace(REVIEWED_ACTION_QUEUE_PATH, proc_path)
+    except OSError:
+        return None
+
+    enrolled_results: list[dict] = []
+    reconciled_vehicles = 0
+    delete_stats = {"deleted_events": 0, "removed_files": 0, "freed_mb": 0.0}
+    try:
+        with open(proc_path, "r", encoding="utf-8") as qf:
+            payload = json.load(qf)
+
+        # 1. Process any verified family enrollments FIRST (before deleting source snapshots)
+        for item in payload.get("enrollments") or []:
+            ev_id = item.get("event_id")
+            snap_id = str(item.get("snap_id") or "").strip()
+            name = str(item.get("name") or "").strip().upper()
+            role = str(item.get("role") or "whitelist").strip().lower()
+            if not name:
+                continue
+            if not ev_id and snap_id:
+                async with AsyncSessionLocal() as session:
+                    r_ev = await session.execute(
+                        select(DetectionEvent.id).where(DetectionEvent.attributes.like(f"{snap_id}%")).limit(1)
+                    )
+                    ev_id = r_ev.scalar_one_or_none()
+            if ev_id:
+                try:
+                    res_enr = await enroll_face_from_detection(int(ev_id), EnrollFaceDTO(name=name, role=role))
+                    enrolled_results.append({"event_id": int(ev_id), **res_enr})
+                except Exception as enr_err:
+                    enrolled_results.append({"event_id": int(ev_id), "error": str(enr_err)})
+
+        # 2. Optionally reconcile resident vehicles
+        if payload.get("reconcile_resident_vehicles"):
+            reconciled_vehicles = await reconcile_resident_vehicle_events()
+
+        # 3. Delete reviewed unnecessary detections + disk files
+        delete_stats = await delete_detection_events(
+            ids=payload.get("delete_ids") or [],
+            snap_ids=payload.get("delete_snap_ids") or [],
+        )
+
+        receipt = {
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+            "enrolled": enrolled_results,
+            "reconciled_vehicles": reconciled_vehicles,
+            "delete_stats": delete_stats,
+        }
+        with open(REVIEWED_ACTION_RECEIPT_PATH, "w", encoding="utf-8") as rf:
+            json.dump(receipt, rf, indent=2)
+        return receipt
+    except Exception as e:
+        print(f"[REVIEWED ACTION QUEUE ERROR] {e}")
+        return {"error": str(e)}
+    finally:
+        if os.path.exists(proc_path):
+            try:
+                os.remove(proc_path)
+            except OSError:
+                pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     await face_engine.sanitize_gallery_on_startup()
     await _cleanup_recent_headless_false_ids()
     await purge_routine_walkers_and_scrub_notes()
+    await reconcile_resident_vehicle_events()
+    await drain_reviewed_action_queue()
     test_breach_marker = "/tmp/command_backups/.purged_initial_test_breaches_v74"
     if not os.path.exists(test_breach_marker):
         await purge_perimeter_breach_events()
@@ -942,6 +1205,16 @@ async def purge_all_detections():
     return {"status": "PURGED"}
 
 
+@app.delete("/api/detections/{event_id}")
+async def delete_single_detection(event_id: int):
+    return await delete_detection_events(ids=[event_id])
+
+
+@app.post("/api/detections/bulk-delete")
+async def bulk_delete_detections(payload: BulkDeleteDetectionsDTO):
+    return await delete_detection_events(ids=payload.ids, snap_ids=payload.snap_ids)
+
+
 @app.post("/api/system/reset")
 async def full_system_reset():
     from app.services.ai_lessons import reset_ai_lessons
@@ -1018,6 +1291,109 @@ async def api_upsert_delivery_rule(payload: dict):
 async def api_delete_delivery_rule(rule_id: str):
     rules = delete_delivery_rule(rule_id)
     return {"rules": rules}
+
+
+# --- v7.4 Household Resident Vehicles & LPR Whitelist Endpoints ---
+def _normalize_resident_vehicle_list(raw_list: list[dict]) -> list[dict]:
+    import re as _re
+
+    out: list[dict] = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        owner = str(item.get("owner") or "RESIDENT").strip().upper()
+        vlabel = str(item.get("vehicle_label") or "VEHICLE").strip().upper()
+        plate = _re.sub(r"[^A-Z0-9]", "", str(item.get("plate") or "").upper())
+        vid = str(item.get("id") or plate or _re.sub(r"[^A-Z0-9]+", "_", f"{owner}_{vlabel}").strip("_")).upper()
+        aliases_raw = item.get("aliases") or []
+        aliases = [str(a).strip().upper() for a in aliases_raw if str(a).strip()]
+        if plate and len(plate) == 6 and f"{plate[:3]} {plate[3:]}" not in aliases:
+            aliases.append(f"{plate[:3]} {plate[3:]}")
+        out.append({
+            "id": vid,
+            "owner": owner,
+            "vehicle_label": vlabel,
+            "plate": plate,
+            "aliases": aliases,
+            "visual_cues": str(item.get("visual_cues") or "").strip(),
+            "verified_snap_ids": [str(s).strip() for s in (item.get("verified_snap_ids") or []) if str(s).strip()][-60:],
+        })
+    return out
+
+
+def _save_resident_vehicles_disk(vehicles: list[dict]) -> list[dict]:
+    from app.agent.orchestrator import RESIDENT_VEHICLES_PATH
+
+    norm = _normalize_resident_vehicle_list(vehicles)
+    os.makedirs(os.path.dirname(RESIDENT_VEHICLES_PATH), exist_ok=True)
+    with open(RESIDENT_VEHICLES_PATH, "w", encoding="utf-8") as f:
+        json.dump(norm, f, indent=2)
+    return norm
+
+
+@app.get("/api/resident-vehicles")
+async def api_get_resident_vehicles():
+    from app.agent.orchestrator import _load_resident_vehicles
+
+    return {"vehicles": _normalize_resident_vehicle_list(_load_resident_vehicles())}
+
+
+@app.post("/api/resident-vehicles")
+async def api_upsert_resident_vehicle(payload: dict):
+    import re as _re
+    from app.agent.orchestrator import _load_resident_vehicles
+
+    owner = str(payload.get("owner") or "").strip().upper()
+    vehicle_label = str(payload.get("vehicle_label") or "").strip().upper()
+    plate = _re.sub(r"[^A-Z0-9]", "", str(payload.get("plate") or "").upper())
+    visual_cues = str(payload.get("visual_cues") or "").strip()
+    raw_aliases = payload.get("aliases") or []
+    if isinstance(raw_aliases, str):
+        raw_aliases = [x.strip().upper() for x in raw_aliases.split(",") if x.strip()]
+
+    if not owner or not vehicle_label:
+        raise HTTPException(status_code=400, detail="Owner and vehicle label are required")
+
+    vid = plate or _re.sub(r"[^A-Z0-9]+", "_", f"{owner}_{vehicle_label}").strip("_")
+    current = _normalize_resident_vehicle_list(_load_resident_vehicles())
+    updated = False
+    for existing in current:
+        if existing["id"] == vid or (plate and existing["plate"] == plate):
+            existing["id"] = vid
+            existing["owner"] = owner
+            existing["vehicle_label"] = vehicle_label
+            existing["plate"] = plate
+            existing["visual_cues"] = visual_cues or existing.get("visual_cues", "")
+            if raw_aliases:
+                existing["aliases"] = list(dict.fromkeys([*(existing.get("aliases") or []), *raw_aliases]))
+            updated = True
+            break
+
+    if not updated:
+        current.append({
+            "id": vid,
+            "owner": owner,
+            "vehicle_label": vehicle_label,
+            "plate": plate,
+            "aliases": raw_aliases,
+            "visual_cues": visual_cues,
+            "verified_snap_ids": [],
+        })
+
+    saved = _save_resident_vehicles_disk(current)
+    await reconcile_resident_vehicle_events()
+    return {"vehicles": saved}
+
+
+@app.delete("/api/resident-vehicles/{vehicle_id}")
+async def api_delete_resident_vehicle(vehicle_id: str):
+    from app.agent.orchestrator import _load_resident_vehicles
+
+    target = vehicle_id.strip().upper()
+    current = _normalize_resident_vehicle_list(_load_resident_vehicles())
+    filtered = [v for v in current if v["id"].upper() != target and v["plate"].upper() != target]
+    saved = _save_resident_vehicles_disk(filtered)
+    return {"vehicles": saved}
 
 # --- v7.1 Teach / Correct AI Endpoint & Inspect Fix ---
 from sqlalchemy import select as _main_select, update as _main_update
@@ -1138,6 +1514,29 @@ async def api_teach_detection(event_id: int, payload: dict):
                 correct_sub_type=clean_carrier,
                 note=note or f"Corrected {wrong_sub} to {clean_carrier}",
             )
+        elif correct_category == "vehicle" and correct_sub_type.upper().startswith("RESIDENT:"):
+            from app.agent.orchestrator import _load_resident_vehicles
+
+            target_vid = correct_sub_type.split(":", 1)[1].strip().upper()
+            rv_list = _normalize_resident_vehicle_list(_load_resident_vehicles())
+            matched_rv = next(
+                (v for v in rv_list if v["id"].upper() == target_vid or v["plate"].upper() == target_vid),
+                None,
+            )
+            if matched_rv:
+                owner = matched_rv["owner"]
+                vlabel = matched_rv["vehicle_label"]
+                plate_str = matched_rv["plate"]
+                final_sub = f"🏠 {owner}'S {vlabel}" + (f" [PLATE: {plate_str}]" if plate_str else "")
+                new_label = f"{slot_prefix}_{owner}_{plate_str or 'VEHICLE'}"
+                ai_note = f"🏠 [RESIDENT VEHICLE: {owner} // {plate_str or vlabel}] Confirmed from '{wrong_sub}'"
+                if snap_id and snap_id not in matched_rv["verified_snap_ids"]:
+                    matched_rv["verified_snap_ids"].append(snap_id)
+                    _save_resident_vehicles_disk(rv_list)
+            else:
+                final_sub = f"🏠 {target_vid}"
+                new_label = f"{slot_prefix}_{target_vid}"
+                ai_note = f"🏠 [RESIDENT VEHICLE] Confirmed '{target_vid}'"
         else:
             final_sub = correct_sub_type.strip().lower()
             new_label = f"{slot_prefix}_{final_sub.replace(' ', '_')}"

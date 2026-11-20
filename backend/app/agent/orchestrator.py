@@ -140,11 +140,39 @@ def _is_isaac_event(sub_type: str | None, full_label: str | None, ai_notes: str 
     )
 
 
+RESIDENT_VEHICLES_PATH = "/tmp/command_faces/resident_vehicles.json"
+
+
+def _load_resident_vehicles() -> list[dict]:
+    if not os.path.exists(RESIDENT_VEHICLES_PATH):
+        return []
+    try:
+        with open(RESIDENT_VEHICLES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _match_resident_vehicle(plate: str, vlm_sub: str = "", summary: str = "") -> dict | None:
+    clean_p = re.sub(r"[^A-Z0-9]", "", (plate or "").upper())
+    for rv in _load_resident_vehicles():
+        canon = re.sub(r"[^A-Z0-9]", "", str(rv.get("plate") or "").upper())
+        aliases = {
+            re.sub(r"[^A-Z0-9]", "", str(a).upper())
+            for a in (rv.get("aliases") or [])
+        }
+        aliases.add(canon)
+        if clean_p and clean_p in aliases:
+            return rv
+    return None
+
+
 def _is_whitelist_family_event(sub_type: str | None, full_label: str | None, face_role: str | None = None) -> bool:
     u_sub = (sub_type or "").upper()
     if "WATCHLIST" in u_sub or "VISITOR_" in u_sub:
         return False
-    if face_role == "whitelist" or u_sub.startswith("ID: "):
+    if face_role == "whitelist" or u_sub.startswith("ID: ") or u_sub.startswith("🏠 "):
         return True
     return False
 
@@ -266,8 +294,8 @@ async def _evaluate_best_confidence_push(
             if _same_subject_track(ev, b) and _is_isaac_event(b.sub_type, b.full_label, b.ai_notes):
                 return
 
-        # 2. Shield whitelisted family on the SAME person/track during normal Home Mode (never let Motion_1 silence a Motion_2 stranger breach)
-        if (not away_active) and (not cam_alert_all) and ev.category == "person":
+        # 2. Shield whitelisted family / resident vehicles on the SAME track during normal Home Mode
+        if (not away_active) and (not cam_alert_all) and ev.category in ("person", "vehicle"):
             if any(_same_subject_track(ev, b) and _is_whitelist_family_event(b.sub_type, b.full_label) for b in burst_events):
                 return
 
@@ -560,17 +588,31 @@ async def deep_inspect_detection(event_id: int) -> dict:
                         else ""
                     )
 
+                    resident_veh_list = _load_resident_vehicles()
+                    resident_veh_hint = ""
+                    if ev.camera_id == "annke_1" and resident_veh_list:
+                        rv_parts = [
+                            f"{rv.get('owner')}'s {rv.get('vehicle_label', 'vehicle')} (plate '{rv.get('plate')}', {rv.get('visual_cues', '')})"
+                            for rv in resident_veh_list
+                        ]
+                        resident_veh_hint = (
+                            "KNOWN HOUSEHOLD MOVING VEHICLES (always extract their license plate accurately; ignore the green central Oregon tree graphic between the 3 digits and 3 letters): "
+                            + "; ".join(rv_parts)
+                            + ". "
+                        )
+
                     prompt = (
                         f"Analyze this security camera image from '{ev.camera_id}' (initial detector guess: category={ev.category}, sub_type={ev.sub_type}). "
                         "For person/delivery detections, Image 1 is the close-up subject crop and Image 2 (if provided) is the full wide scene context. "
                         f"{resident_truck_rule}"
+                        f"{resident_veh_hint}"
                         f"USER TAUGHT RULES FOR THIS CAMERA: {lessons_text or 'None'}. "
                         f"CONFIGURED DELIVERY/SERVICE RULES: {rules_text}. "
                         "Note: grayscale images are infrared night vision on dry pavement. "
                         "If this is purely an inanimate false trigger (empty pavement, wind-blown tree/shadow, IR spiderweb, stationary unattended trash bin, or headlight glare with NO actual person, vehicle, or animal present), set 'valid_target' to false and 'category' to 'false_alarm'. "
                         "If a person is walking an animal on a sidewalk/leash, classify sub_type as 'dog' and mention the owner/leash in summary. "
                         "If a small four-legged animal is alone on the driveway/pavement with NO person or leash visible, classify sub_type as 'cat'. "
-                        "Only populate 'plate' when a moving non-resident vehicle has a clearly legible alphanumeric license plate; otherwise set 'plate' to 'NONE'. "
+                        "Always populate 'plate' when ANY moving vehicle (household or visitor) has a legible alphanumeric license plate (on Oregon plates, omit the central tree icon between digits and letters); otherwise set 'plate' to 'NONE'. "
                         f"If a commercial delivery carrier or service crew (like LANDSCAPERS with mowers/blowers/vests/bandanas or AMAZON/UPS/FEDEX/USPS with branded vest/uniform, high-vis safety vest with handheld delivery scanner phone, delivery van/truck, or shipping box) is visible, set 'carrier' to one of {active_rule_names} (or 'NONE') and note if a package was left. "
                         "CRITICAL GUARDRAIL: Residents or people in casual clothes rolling wheeled curbside trash, recycling, or yard-waste bins (blue, black, green, or gray plastic carts with lids/wheels) or walking around parked household vehicles without a commercial delivery uniform or delivery van are household activity ('category': 'person', 'carrier': 'NONE') — NEVER classify wheeled blue recycling/trash bins as AMAZON. "
                         "Set 'school_commuter' to true ONLY if the subject is a student/youth wearing a school backpack who is casually walking along the public sidewalk or exiting away toward the street with NO package delivery and NO tampering with vehicles/house. "
@@ -751,11 +793,19 @@ async def deep_inspect_detection(event_id: int) -> dict:
                                     ev.sub_type = vlm_sub[:32]
                                     ev.full_label = f"{ev.motion_slot}_{vlm_sub.replace(' ', '_')[:24]}"
                             elif ev.category == "vehicle":
-                                plate_str = f" [PLATE: {plate}]" if plate else " [NO PLATE VIEW]"
-                                desc = vlm_sub.upper() if vlm_sub and vlm_sub != "none" else (ev.sub_type or "VEHICLE").upper()
-                                ev.sub_type = f"🚗 {desc}{plate_str}"[:120]
-                                if plate:
-                                    ev.full_label = f"{ev.motion_slot}_{plate.replace(' ', '')}"[:120]
+                                matched_rv = _match_resident_vehicle(plate, vlm_sub, summary)
+                                if matched_rv:
+                                    plate = str(matched_rv.get("plate") or plate).upper()
+                                    owner_up = str(matched_rv.get("owner") or "RESIDENT").upper()
+                                    veh_lbl = str(matched_rv.get("vehicle_label") or vlm_sub or "VEHICLE").upper()
+                                    ev.sub_type = f"🏠 {owner_up}'S {veh_lbl} [PLATE: {plate}]"[:120]
+                                    ev.full_label = f"{ev.motion_slot}_{owner_up}_VEHICLE"[:120]
+                                else:
+                                    plate_str = f" [PLATE: {plate}]" if plate else " [NO PLATE VIEW]"
+                                    desc = vlm_sub.upper() if vlm_sub and vlm_sub != "none" else (ev.sub_type or "VEHICLE").upper()
+                                    ev.sub_type = f"🚗 {desc}{plate_str}"[:120]
+                                    if plate:
+                                        ev.full_label = f"{ev.motion_slot}_{plate.replace(' ', '')}"[:120]
 
                             face_prefix = f"🧬 [{recognized_face}] " if recognized_face else ""
                             plate_prefix = f"[PLATE: {plate}] " if plate else ""

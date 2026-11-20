@@ -48,6 +48,16 @@ export interface KnownFaceItem {
   created_at: string | null;
 }
 
+export interface ResidentVehicleItem {
+  id: string;
+  owner: string;
+  vehicle_label: string;
+  plate: string;
+  aliases: string[];
+  visual_cues: string;
+  verified_snap_ids?: string[];
+}
+
 export interface HeatmapPoint {
   x: number;
   y: number;
