@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { CameraScheduleConfig, ConnectionState, TelemetryHeartbeat } from '../types/telemetry';
-import { Activity, Bell, BellOff, BookOpen, Bot, Camera, Check, Cpu, Home, Plane, Send, Shield, Wifi, X } from 'lucide-react';
+import { Activity, Bell, BellOff, BookOpen, Bot, Camera, Check, Cpu, FileText, Home, Plane, Send, Shield, Wifi, X } from 'lucide-react';
 
 interface StatusHeaderProps {
   telemetry: TelemetryHeartbeat | null;
@@ -43,6 +43,7 @@ export function StatusHeader({
   const [dailySitrepEnabled, setDailySitrepEnabled] = useState(true);
   const [dailySitrepTime, setDailySitrepTime] = useState('05:00');
   const [localAway, setLocalAway] = useState(false);
+  const [localSilentLog, setLocalSilentLog] = useState(false);
   const [botUsername, setBotUsername] = useState<string | null>(null);
   const [botError, setBotError] = useState<string | null>(null);
   const [pushStatus, setPushStatus] = useState<string | null>(null);
@@ -62,6 +63,7 @@ export function StatusHeader({
           setDailySitrepEnabled(data.daily_sitrep_enabled !== false);
           setDailySitrepTime(data.daily_sitrep_time || '05:00');
           setLocalAway(Boolean(data.away_mode));
+          setLocalSilentLog(Boolean(data.cam_silent_logging));
           setBotUsername(data.bot_status?.bot_username || null);
           setBotError(data.bot_status?.last_error || null);
         }
@@ -74,9 +76,29 @@ export function StatusHeader({
   }, [apiBase]);
 
   const isAway = telemetry?.away_mode !== undefined ? telemetry.away_mode : localAway;
+  const isCamLogOnly =
+    telemetry?.cam_silent_logging !== undefined ? telemetry.cam_silent_logging : localSilentLog;
   const awayGraceSec = telemetry?.away_grace_remaining || 0;
   const muteRemSec = telemetry?.mute_remaining || 0;
   const isBotConnected = Boolean(telemetry?.bot_connected);
+
+  const toggleSilentLogging = async () => {
+    const nextVal = !isCamLogOnly;
+    setLocalSilentLog(nextVal);
+    try {
+      const res = await fetch(`${apiBase}/api/push/silent-logging`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: nextVal }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setLocalSilentLog(Boolean(data.cam_silent_logging));
+      }
+    } catch {
+      // ignore transient error
+    }
+  };
 
   const toggleAwayMode = async (targetAway: boolean, graceSeconds = 180) => {
     setLocalAway(targetAway);
@@ -253,6 +275,24 @@ export function StatusHeader({
             </button>
           )}
         </div>
+
+        {/* 1-Click Camera Silent Logging Pill (Record & Train Face ID with Zero Camera Push Alarms while HOME) */}
+        <button
+          onClick={toggleSilentLogging}
+          title={
+            isCamLogOnly
+              ? 'SILENT CAMERA LOGGING ON — Recording all clips, Face ID & AI notes to Kill-Feed with zero camera push alarms while HOME (YoLink Perimeter & Away Mode still alert). Click to resume camera alarms.'
+              : 'Click to enable Silent Camera Logging Mode (records clips & trains Face ID into Kill-Feed with zero camera push alarms while HOME)'
+          }
+          className={`px-2 py-1 rounded text-[10px] font-bold border flex items-center gap-1 cursor-pointer transition-all ${
+            isCamLogOnly
+              ? 'bg-violet-600 hover:bg-violet-500 text-white border-violet-300 shadow-[0_0_12px_rgba(139,92,246,0.5)]'
+              : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border-zinc-700'
+          }`}
+        >
+          <FileText className="w-3 h-3" />
+          <span>{isCamLogOnly ? 'LOG·ONLY · ON' : 'LOG·ONLY'}</span>
+        </button>
 
         {muteRemSec > 0 && (
           <button

@@ -69,6 +69,7 @@ class ScheduleDTO(BaseModel):
     start_time: str
     end_time: str
     alert_whitelist: bool = False
+    silent_logging: bool = False
 
 
 class EnrollFaceDTO(BaseModel):
@@ -114,6 +115,10 @@ class MuteDTO(BaseModel):
     minutes: int = 60
 
 
+class SilentLoggingDTO(BaseModel):
+    enabled: bool
+
+
 class AgentCommandDTO(BaseModel):
     prompt: str
 
@@ -146,6 +151,7 @@ async def sync_schedules_to_engine(cv_engine: EdgeCVEngine):
                 "start_time": "23:30" if s in ("tapo_1", "tapo_2") else "21:00",
                 "end_time": "05:00" if s in ("tapo_1", "tapo_2") else "06:00",
                 "alert_whitelist": False,
+                "silent_logging": False,
             }
             for s in STREAMS
         }
@@ -156,6 +162,7 @@ async def sync_schedules_to_engine(cv_engine: EdgeCVEngine):
                 "start_time": r.start_time,
                 "end_time": r.end_time,
                 "alert_whitelist": bool(getattr(r, "alert_whitelist", False)),
+                "silent_logging": bool(getattr(r, "silent_logging", False)),
             }
         cv_engine.set_schedules(sched_map)
         return cv_engine.get_schedules_status()
@@ -401,7 +408,12 @@ async def lifespan(app: FastAPI):
     app.state.cv_engine = cv_engine
     perimeter_service.bind_cv_engine(cv_engine)
     init_push = await get_push_config()
-    cv_engine.set_away_and_mute_state(init_push.away_mode, init_push.away_armed_at, init_push.mute_until)
+    cv_engine.set_away_and_mute_state(
+        init_push.away_mode,
+        init_push.away_armed_at,
+        init_push.mute_until,
+        bool(getattr(init_push, "cam_silent_logging", False)),
+    )
     if init_push.away_mode:
         await perimeter_service.sync_with_away_mode(init_push.away_mode, init_push.away_armed_at)
     await sync_zones_to_engine(cv_engine)
@@ -466,6 +478,7 @@ async def read_push_settings():
         "away_mode": bool(getattr(cfg, "away_mode", False)),
         "away_grace_remaining": max(0, int(round((getattr(cfg, "away_armed_at", 0.0) or 0.0) - now))) if getattr(cfg, "away_mode", False) else 0,
         "mute_remaining": max(0, int(round((getattr(cfg, "mute_until", 0.0) or 0.0) - now))),
+        "cam_silent_logging": bool(getattr(cfg, "cam_silent_logging", False)),
         "daily_sitrep_enabled": bool(getattr(cfg, "daily_sitrep_enabled", True)),
         "daily_sitrep_time": getattr(cfg, "daily_sitrep_time", "05:00") or "05:00",
         "bot_status": discord_bot_state,
@@ -504,6 +517,24 @@ async def toggle_away_mode_endpoint(payload: AwayModeDTO):
 @app.post("/api/push/mute")
 async def mute_push_endpoint(payload: MuteDTO):
     return await set_mute_minutes_db(app.state.cv_engine, payload.minutes)
+
+
+@app.post("/api/push/silent-logging")
+async def toggle_silent_logging_endpoint(payload: SilentLoggingDTO):
+    async with AsyncSessionLocal() as session:
+        cfg = await session.get(PushSettings, 1)
+        if not cfg:
+            cfg = PushSettings(id=1)
+            session.add(cfg)
+        cfg.cam_silent_logging = bool(payload.enabled)
+        await session.commit()
+        away_mode = bool(cfg.away_mode)
+        away_armed_at = float(cfg.away_armed_at or 0.0)
+        mute_until = float(cfg.mute_until or 0.0)
+    app.state.cv_engine.set_away_and_mute_state(
+        away_mode, away_armed_at, mute_until, bool(payload.enabled)
+    )
+    return {"cam_silent_logging": bool(payload.enabled)}
 
 
 @app.post("/api/push/sitrep")
@@ -762,6 +793,7 @@ async def update_camera_schedule(camera_id: str, payload: ScheduleDTO):
             existing.start_time = payload.start_time
             existing.end_time = payload.end_time
             existing.alert_whitelist = payload.alert_whitelist
+            existing.silent_logging = payload.silent_logging
         else:
             session.add(
                 CameraSchedule(
@@ -770,6 +802,7 @@ async def update_camera_schedule(camera_id: str, payload: ScheduleDTO):
                     start_time=payload.start_time,
                     end_time=payload.end_time,
                     alert_whitelist=payload.alert_whitelist,
+                    silent_logging=payload.silent_logging,
                 )
             )
         await session.commit()
@@ -1183,6 +1216,16 @@ async def api_perimeter_disarm():
 @app.post("/api/perimeter/mock-toggle/{entity_id}")
 async def api_perimeter_mock_toggle(entity_id: str):
     return await perimeter_service.toggle_mock_zone(entity_id)
+
+
+@app.post("/api/perimeter/bypass/{entity_id}")
+async def api_perimeter_toggle_bypass(entity_id: str):
+    return await perimeter_service.set_zone_bypass(entity_id)
+
+
+@app.post("/api/perimeter/bypass-open")
+async def api_perimeter_bypass_open():
+    return await perimeter_service.bypass_all_open_zones()
 
 
 @app.post("/api/perimeter/purge-breaches")

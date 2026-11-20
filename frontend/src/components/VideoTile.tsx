@@ -92,6 +92,7 @@ export function VideoTile({
   const [schedStart, setSchedStart] = useState<string>('21:00');
   const [schedEnd, setSchedEnd] = useState<string>('06:00');
   const [alertWhitelist, setAlertWhitelist] = useState<boolean>(false);
+  const [silentLogging, setSilentLogging] = useState<boolean>(false);
 
   useEffect(() => {
     if (schedule) {
@@ -99,6 +100,7 @@ export function VideoTile({
       setSchedStart(schedule.start_time || '21:00');
       setSchedEnd(schedule.end_time || '06:00');
       setAlertWhitelist(Boolean(schedule.alert_whitelist));
+      setSilentLogging(Boolean(schedule.silent_logging));
     }
   }, [schedule]);
 
@@ -172,11 +174,14 @@ export function VideoTile({
 
   const saveSchedule = async (
     modeOverride?: 'always_record' | 'paused' | 'schedule',
-    alertWhitelistOverride?: boolean
+    alertWhitelistOverride?: boolean,
+    silentLoggingOverride?: boolean
   ) => {
     const targetMode = modeOverride || schedMode;
     const targetAlertWhitelist =
       alertWhitelistOverride !== undefined ? alertWhitelistOverride : alertWhitelist;
+    const targetSilentLogging =
+      silentLoggingOverride !== undefined ? silentLoggingOverride : silentLogging;
     try {
       const res = await fetch(`${apiBase}/api/cameras/${streamName}/schedule`, {
         method: 'POST',
@@ -186,6 +191,7 @@ export function VideoTile({
           start_time: schedStart,
           end_time: schedEnd,
           alert_whitelist: targetAlertWhitelist,
+          silent_logging: targetSilentLogging,
         }),
       });
       if (res.ok && onScheduleUpdated) {
@@ -198,10 +204,21 @@ export function VideoTile({
     }
   };
 
-  const toggleFamilyAlert = async () => {
-    const nextVal = !alertWhitelist;
-    setAlertWhitelist(nextVal);
-    await saveSchedule(schedMode, nextVal);
+  const cycleCameraAlertPosture = async () => {
+    // Cycles: FAM·SILENT -> LOG·ONLY (record & log silently, zero alarms) -> FAM·ALERT -> FAM·SILENT
+    if (!silentLogging && !alertWhitelist) {
+      setSilentLogging(true);
+      setAlertWhitelist(false);
+      await saveSchedule(schedMode, false, true);
+    } else if (silentLogging) {
+      setSilentLogging(false);
+      setAlertWhitelist(true);
+      await saveSchedule(schedMode, true, false);
+    } else {
+      setSilentLogging(false);
+      setAlertWhitelist(false);
+      await saveSchedule(schedMode, false, false);
+    }
   };
 
   const startDrawing = (type: 'exclusion' | 'tripwire') => {
@@ -587,20 +604,32 @@ export function VideoTile({
               </button>
 
               <button
-                onClick={toggleFamilyAlert}
+                onClick={cycleCameraAlertPosture}
                 title={
-                  alertWhitelist
-                    ? 'Family / All Alerts ON for this camera (ISAAC exempt) — Click to silence family'
-                    : 'Family Whitelist Silent — Click to alert on Family & All detections on this camera (ISAAC exempt)'
+                  silentLogging
+                    ? 'LOG·ONLY ON — Recording & Face ID logging silently with zero push alarms while HOME. Click to switch to FAM·ALERT.'
+                    : alertWhitelist
+                    ? 'FAM·ALERT ON — Alerting on Family & All detections (ISAAC exempt). Click to switch to FAM·SILENT.'
+                    : 'FAM·SILENT — Alerting on Strangers/Deliveries, silent on Family. Click to switch to LOG·ONLY (silent logging, zero alarms).'
                 }
                 className={`px-1.5 py-1 rounded text-[10px] font-mono font-bold border flex items-center gap-1 cursor-pointer transition-colors ${
-                  alertWhitelist
+                  silentLogging
+                    ? 'bg-violet-600 text-white border-violet-300 shadow-[0_0_10px_rgba(139,92,246,0.45)]'
+                    : alertWhitelist
                     ? 'bg-sky-600 text-white border-sky-400 shadow-[0_0_10px_rgba(14,165,233,0.45)]'
                     : 'bg-zinc-950/85 hover:bg-zinc-800 text-zinc-400 border-zinc-800'
                 }`}
               >
-                {alertWhitelist ? <Bell className="w-3 h-3" /> : <BellOff className="w-3 h-3" />}
-                <span>{alertWhitelist ? 'FAM·ALERT' : 'FAM·SILENT'}</span>
+                {silentLogging ? (
+                  <Database className="w-3 h-3" />
+                ) : alertWhitelist ? (
+                  <Bell className="w-3 h-3" />
+                ) : (
+                  <BellOff className="w-3 h-3" />
+                )}
+                <span>
+                  {silentLogging ? 'LOG·ONLY' : alertWhitelist ? 'FAM·ALERT' : 'FAM·SILENT'}
+                </span>
               </button>
 
               <button
@@ -789,21 +818,53 @@ export function VideoTile({
             </div>
           )}
 
-          <div className="pt-2 border-t border-zinc-800 flex items-center justify-between gap-2">
-            <div className="text-[10px] text-zinc-300 leading-tight">
-              <div className="font-bold text-sky-300">FAMILY / ALL ALERTS</div>
-              <div className="text-[9px] text-zinc-400">Alert on Whitelist (ISAAC exempt)</div>
+          <div className="pt-2 border-t border-zinc-800 space-y-1.5">
+            <div className="text-[10px] font-bold text-zinc-300">CAMERA PUSH POSTURE (HOME):</div>
+            <div className="grid grid-cols-3 gap-1">
+              <button
+                onClick={() => {
+                  setSilentLogging(false);
+                  setAlertWhitelist(false);
+                  saveSchedule(schedMode, false, false);
+                }}
+                className={`py-1 rounded text-[9px] font-bold border cursor-pointer ${
+                  !silentLogging && !alertWhitelist
+                    ? 'bg-emerald-600 text-white border-emerald-400'
+                    : 'bg-zinc-900 text-zinc-400 border-zinc-800'
+                }`}
+              >
+                FAM·SILENT
+              </button>
+              <button
+                onClick={() => {
+                  setSilentLogging(true);
+                  setAlertWhitelist(false);
+                  saveSchedule(schedMode, false, true);
+                }}
+                title="Record & log clips/Face ID silently to Kill-Feed with zero push alarms while HOME"
+                className={`py-1 rounded text-[9px] font-bold border cursor-pointer ${
+                  silentLogging
+                    ? 'bg-violet-600 text-white border-violet-300'
+                    : 'bg-zinc-900 text-zinc-400 border-zinc-800'
+                }`}
+              >
+                LOG·ONLY
+              </button>
+              <button
+                onClick={() => {
+                  setSilentLogging(false);
+                  setAlertWhitelist(true);
+                  saveSchedule(schedMode, true, false);
+                }}
+                className={`py-1 rounded text-[9px] font-bold border cursor-pointer ${
+                  !silentLogging && alertWhitelist
+                    ? 'bg-sky-600 text-white border-sky-400'
+                    : 'bg-zinc-900 text-zinc-400 border-zinc-800'
+                }`}
+              >
+                FAM·ALERT
+              </button>
             </div>
-            <button
-              onClick={toggleFamilyAlert}
-              className={`px-2 py-1 rounded text-[10px] font-bold border cursor-pointer ${
-                alertWhitelist
-                  ? 'bg-sky-600 text-white border-sky-400'
-                  : 'bg-zinc-900 text-zinc-400 border-zinc-700'
-              }`}
-            >
-              {alertWhitelist ? 'ON' : 'OFF'}
-            </button>
           </div>
         </div>
       )}

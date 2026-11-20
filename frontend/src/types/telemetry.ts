@@ -31,6 +31,7 @@ export interface CameraScheduleConfig {
   start_time: string;
   end_time: string;
   alert_whitelist?: boolean;
+  silent_logging?: boolean;
   away_override?: boolean;
   currently_recording: boolean;
   server_time?: string;
@@ -116,6 +117,7 @@ export interface TelemetryHeartbeat {
   away_mode?: boolean;
   away_grace_remaining?: number;
   mute_remaining?: number;
+  cam_silent_logging?: boolean;
   bot_connected?: boolean;
   perimeter?: PerimeterSnapshot;
   detections?: Record<string, BoundingBoxDetection[]>;

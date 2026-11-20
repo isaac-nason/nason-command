@@ -232,6 +232,7 @@ interface House3DViewerProps {
   focusSeq?: number;
   onSelectZone?: (entityId: string | null) => void;
   onEditZone?: (entityId: string) => void;
+  onToggleBypass?: (entityId: string) => void;
   onZoneClick?: (entityId: string) => void;
   onFocusStream?: (streamName: string) => void;
 }
@@ -242,6 +243,7 @@ export function House3DViewer({
   focusSeq = 0,
   onSelectZone,
   onEditZone,
+  onToggleBypass,
   onZoneClick,
   onFocusStream,
 }: House3DViewerProps) {
@@ -791,11 +793,16 @@ export function House3DViewer({
           fMat.color.setHex(0xef4444);
           fMat.opacity = 1.0;
           sph.scale.setScalar(1.38 + Math.sin(t * 12) * 0.3);
+        } else if (isByp) {
+          sMat.color.setHex(0xf59e0b);
+          fMat.color.setHex(0xf59e0b);
+          fMat.opacity = 0.9;
+          sph.scale.setScalar(1.05);
         } else if (isOpen) {
-          sMat.color.setHex(isByp ? 0xf59e0b : 0xef4444);
-          fMat.color.setHex(isByp ? 0xf59e0b : 0xef4444);
-          fMat.opacity = 0.95;
-          sph.scale.setScalar(1.18 + Math.sin(t * 6) * 0.14);
+          sMat.color.setHex(0xef4444);
+          fMat.color.setHex(0xef4444);
+          fMat.opacity = 0.92;
+          sph.scale.setScalar(1.16 + Math.sin(t * 5) * 0.12);
         } else if (isSelected) {
           sMat.color.setHex(0x34d399);
           fMat.color.setHex(0x34d399);
@@ -808,7 +815,11 @@ export function House3DViewer({
           sph.scale.setScalar(0.85);
         }
 
-        const emitShockwave = isTrigTarget || (isOpen && !isByp);
+        const isArmedPosture =
+          curSnap.alarm_state === 'armed_night' ||
+          curSnap.alarm_state === 'armed_away' ||
+          curSnap.alarm_state === 'triggered';
+        const emitShockwave = isTrigTarget || (isArmedPosture && isOpen && !isByp);
         if (emitShockwave) {
           sr1.visible = true;
           sr2.visible = true;
@@ -953,7 +964,7 @@ export function House3DViewer({
           const isOpen = so.state === 'OPEN';
           const isSelected = selectedZoneId === so.entityId;
           const showFullPill =
-            isOpen || so.isTriggeredTarget || isSelected || hoveredZoneId === so.entityId;
+            isOpen || so.bypassed || so.isTriggeredTarget || isSelected || hoveredZoneId === so.entityId;
           return (
             <div
               key={so.entityId}
@@ -982,10 +993,10 @@ export function House3DViewer({
                   ? `z-20 px-2 py-0.5 rounded text-[10px] font-bold border flex items-center gap-1 whitespace-nowrap shadow-lg ${
                       so.isTriggeredTarget
                         ? 'animate-bounce bg-red-600 text-white border-red-200 shadow-[0_0_16px_rgba(239,68,68,0.9)]'
+                        : so.bypassed
+                        ? 'bg-amber-950/95 text-amber-200 border-amber-400'
                         : isOpen
-                        ? so.bypassed
-                          ? 'bg-amber-950/95 text-amber-200 border-amber-400'
-                          : 'bg-red-950/95 text-red-100 border-red-500 shadow-[0_0_12px_rgba(239,68,68,0.5)]'
+                        ? 'bg-red-950/95 text-red-100 border-red-500 shadow-[0_0_12px_rgba(239,68,68,0.45)]'
                         : isSelected
                         ? 'bg-emerald-950/95 text-emerald-200 border-emerald-400 shadow-[0_0_14px_rgba(16,185,129,0.55)]'
                         : 'bg-zinc-950/95 text-cyan-200 border-cyan-400/60'
@@ -997,17 +1008,40 @@ export function House3DViewer({
                 <>
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${
-                      isOpen
-                        ? so.bypassed
-                          ? 'bg-amber-400'
-                          : 'bg-white animate-ping'
+                      so.bypassed
+                        ? 'bg-amber-400'
+                        : isOpen
+                        ? so.isTriggeredTarget
+                          ? 'bg-white animate-ping'
+                          : 'bg-red-400'
                         : 'bg-emerald-400'
                     }`}
                   />
                   <span>{so.name}</span>
                   <span className="text-[8px] opacity-80">
-                    {isOpen ? (so.bypassed ? 'BYP' : 'OPEN') : 'OK'}
+                    {so.bypassed ? 'BYP' : isOpen ? 'OPEN' : 'OK'}
                   </span>
+                  {onToggleBypass && (isOpen || so.bypassed || isSelected || hoveredZoneId === so.entityId) && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onToggleBypass(so.entityId);
+                      }}
+                      title={
+                        so.bypassed
+                          ? `Remove bypass on ${so.name}`
+                          : `Bypass ${so.name} (auto-clears once closed)`
+                      }
+                      className={`ml-0.5 px-1.5 py-0.2 rounded text-[8px] font-bold border cursor-pointer ${
+                        so.bypassed
+                          ? 'bg-amber-500/30 hover:bg-amber-500/50 text-amber-100 border-amber-300/60'
+                          : 'bg-amber-500 hover:bg-amber-400 text-zinc-950 border-amber-200'
+                      }`}
+                    >
+                      {so.bypassed ? 'UNBYP' : 'BYPASS'}
+                    </button>
+                  )}
                 </>
               )}
             </div>
@@ -1069,6 +1103,24 @@ export function House3DViewer({
           <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-950/90 border border-emerald-500/50 text-[10px] text-emerald-200">
             <span className="font-bold">{selectedMapped.zone.name}</span>
             <span className="text-emerald-400/75 hidden md:inline">({selectedMapped.anchor.label})</span>
+            {onToggleBypass && (
+              <button
+                type="button"
+                onClick={() => onToggleBypass(selectedMapped.zone.entity_id)}
+                title={
+                  selectedMapped.zone.bypassed
+                    ? 'Remove bypass on this sensor'
+                    : 'Bypass this sensor (auto-clears when closed)'
+                }
+                className={`px-1.5 py-0.5 rounded font-bold cursor-pointer ${
+                  selectedMapped.zone.bypassed
+                    ? 'bg-amber-600 hover:bg-amber-500 text-white'
+                    : 'bg-amber-500 hover:bg-amber-400 text-zinc-950'
+                }`}
+              >
+                {selectedMapped.zone.bypassed ? 'UNBYPASS' : 'BYPASS'}
+              </button>
+            )}
             {onEditZone && (
               <button
                 type="button"

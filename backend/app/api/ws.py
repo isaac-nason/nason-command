@@ -40,6 +40,7 @@ async def telemetry_and_cv_broadcaster(cv_engine):
         away_mode = bool(getattr(cv_engine, "away_mode", False))
         away_armed_at = float(getattr(cv_engine, "away_armed_at", 0.0) or 0.0)
         mute_until = float(getattr(cv_engine, "mute_until", 0.0) or 0.0)
+        cam_silent_logging = bool(getattr(cv_engine, "cam_silent_logging", False))
         payload = {
             "type": "HEARTBEAT",
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -49,6 +50,7 @@ async def telemetry_and_cv_broadcaster(cv_engine):
             "away_mode": away_mode,
             "away_grace_remaining": max(0, int(round(away_armed_at - now))) if away_mode else 0,
             "mute_remaining": max(0, int(round(mute_until - now))),
+            "cam_silent_logging": cam_silent_logging,
             "bot_connected": bool(discord_bot_state.get("connected", False)),
             "perimeter": perimeter_service.get_snapshot(),
             "detections": cv_engine.latest_detections,

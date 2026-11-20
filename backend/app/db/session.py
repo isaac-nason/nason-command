@@ -31,6 +31,12 @@ async def init_db():
             text("ALTER TABLE camera_schedules ADD COLUMN IF NOT EXISTS alert_whitelist BOOLEAN DEFAULT FALSE")
         )
         await conn.execute(
+            text("ALTER TABLE camera_schedules ADD COLUMN IF NOT EXISTS silent_logging BOOLEAN DEFAULT FALSE")
+        )
+        await conn.execute(
+            text("ALTER TABLE push_settings ADD COLUMN IF NOT EXISTS cam_silent_logging BOOLEAN DEFAULT FALSE")
+        )
+        await conn.execute(
             text("ALTER TABLE push_settings ADD COLUMN IF NOT EXISTS discord_bot_token TEXT DEFAULT ''")
         )
         await conn.execute(

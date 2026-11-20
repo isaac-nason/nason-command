@@ -46,6 +46,7 @@ class CameraSchedule(Base):
     start_time: Mapped[str] = mapped_column(String(10), default="21:00")
     end_time: Mapped[str] = mapped_column(String(10), default="06:00")
     alert_whitelist: Mapped[bool] = mapped_column(Boolean, default=False)
+    silent_logging: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class KnownFace(Base):
@@ -75,5 +76,6 @@ class PushSettings(Base):
     away_mode: Mapped[bool] = mapped_column(Boolean, default=False)
     away_armed_at: Mapped[float] = mapped_column(Float, default=0.0)
     mute_until: Mapped[float] = mapped_column(Float, default=0.0)
+    cam_silent_logging: Mapped[bool] = mapped_column(Boolean, default=False)
     daily_sitrep_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     daily_sitrep_time: Mapped[str] = mapped_column(String(10), default="05:00")

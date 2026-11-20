@@ -17,6 +17,7 @@ import {
   Settings,
   ShieldAlert,
   ShieldCheck,
+  ShieldOff,
   Volume2,
   X,
 } from 'lucide-react';
@@ -104,7 +105,7 @@ export function PerimeterSecurityPanel({
     prevAlarmStateRef.current = curr;
   }, [snap?.alarm_state]);
 
-  // Browser Console Audible Klaxon when Siren is Active (works in both Mock & Live modes)
+  // Browser Console Avionics Master Caution Chime (D5-D5 -> A4 syncopated mallet, 1.25s cycle)
   useEffect(() => {
     const sirenShouldSound =
       snap?.alarm_state === 'triggered' && snap?.siren_state === 'on' && consoleAudio;
@@ -116,31 +117,55 @@ export function PerimeterSecurityPanel({
     if (!AudioCtx) return;
 
     let ctx: AudioContext | null = null;
-    let high = true;
-    const pulse = () => {
+    const hits: [number, number, number, number][] = [
+      [0.0, 587.33, 0.16, 0.42],
+      [0.13, 587.33, 0.16, 0.45],
+      [0.28, 440.0, 0.15, 0.62],
+    ];
+
+    const playCautionCycle = () => {
       try {
         if (!ctx) ctx = new AudioCtx();
         if (ctx.state === 'suspended') {
           ctx.resume().catch(() => {});
         }
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.value = high ? 880 : 660;
-        high = !high;
-        gain.gain.setValueAtTime(0.14, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.42);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.43);
+        const base = ctx.currentTime;
+        for (const [offset, freq, peak, dur] of hits) {
+          const t0 = base + offset;
+          const masterGain = ctx.createGain();
+          masterGain.gain.setValueAtTime(0.0001, t0);
+          masterGain.gain.linearRampToValueAtTime(peak, t0 + 0.004);
+          masterGain.gain.exponentialRampToValueAtTime(0.0005, t0 + dur);
+          masterGain.connect(ctx.destination);
+
+          const oscSine = ctx.createOscillator();
+          const sineMix = ctx.createGain();
+          oscSine.type = 'sine';
+          oscSine.frequency.setValueAtTime(freq, t0);
+          sineMix.gain.setValueAtTime(0.62, t0);
+          oscSine.connect(sineMix);
+          sineMix.connect(masterGain);
+
+          const oscTri = ctx.createOscillator();
+          const triMix = ctx.createGain();
+          oscTri.type = 'triangle';
+          oscTri.frequency.setValueAtTime(freq, t0);
+          triMix.gain.setValueAtTime(0.38, t0);
+          oscTri.connect(triMix);
+          triMix.connect(masterGain);
+
+          oscSine.start(t0);
+          oscTri.start(t0);
+          oscSine.stop(t0 + dur + 0.01);
+          oscTri.stop(t0 + dur + 0.01);
+        }
       } catch {
         // ignore browser autoplay block
       }
     };
 
-    pulse();
-    const interval = window.setInterval(pulse, 500);
+    playCautionCycle();
+    const interval = window.setInterval(playCautionCycle, 1250);
     return () => {
       window.clearInterval(interval);
       if (ctx) {
@@ -296,12 +321,44 @@ export function PerimeterSecurityPanel({
     setViewMode('3d');
   };
 
+  const handleToggleBypass = async (entityId: string) => {
+    try {
+      const res = await fetch(
+        `${apiBase}/api/perimeter/bypass/${encodeURIComponent(entityId)}`,
+        { method: 'POST' }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (data.snapshot) setLocalSnap(data.snapshot);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleBypassAllOpen = async () => {
+    setBusy(true);
+    try {
+      const res = await fetch(`${apiBase}/api/perimeter/bypass-open`, { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.snapshot) setLocalSnap(data.snapshot);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (!snap) return null;
 
   const alarmState = snap.alarm_state;
   const isTriggered = alarmState === 'triggered';
   const isArmed = alarmState === 'armed_night' || alarmState === 'armed_away';
   const isArming = alarmState === 'arming';
+  const unbypassedOpenCount = snap.zones.filter((z) => z.state === 'OPEN' && !z.bypassed).length;
+  const bypassedCount = snap.zones.filter((z) => Boolean(z.bypassed)).length;
 
   let bannerStyle = 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40';
   let bannerText = 'DISARMED';
@@ -393,16 +450,41 @@ export function PerimeterSecurityPanel({
             <span className="text-zinc-600">|</span> Open Zones:{' '}
             <span
               className={`font-bold ${
-                snap.breached_count > 0 ? 'text-red-400' : 'text-emerald-400'
+                unbypassedOpenCount > 0
+                  ? 'text-red-400'
+                  : snap.breached_count > 0
+                  ? 'text-amber-300'
+                  : 'text-emerald-400'
               }`}
             >
               {snap.breached_count}/{snap.total_zones}
             </span>
+            {bypassedCount > 0 && (
+              <span className="ml-1 px-1.5 py-0.2 rounded bg-amber-950/90 border border-amber-500/40 text-amber-300 text-[9px] font-bold">
+                {bypassedCount} BYPASSED
+              </span>
+            )}
           </span>
         </div>
 
         {/* One-Click Tactical Controls */}
         <div className="flex items-center gap-1.5 flex-wrap">
+          {unbypassedOpenCount > 0 && (
+            <button
+              onClick={handleBypassAllOpen}
+              disabled={busy}
+              title={
+                isTriggered
+                  ? 'Bypass open zone(s), silence siren, and keep remaining zones armed'
+                  : 'Bypass currently open window/door(s) until they physically close'
+              }
+              className="px-2.5 py-1 rounded text-[11px] font-bold bg-amber-500 hover:bg-amber-400 text-zinc-950 border border-amber-200 flex items-center gap-1 cursor-pointer transition-all shadow-[0_0_12px_rgba(245,158,11,0.35)]"
+            >
+              <ShieldOff className="w-3.5 h-3.5" />
+              {isTriggered ? 'BYPASS & SILENCE' : `BYPASS OPEN (${unbypassedOpenCount})`}
+            </button>
+          )}
+
           <button
             onClick={() => handleArmNight(false)}
             disabled={busy || alarmState === 'armed_night'}
@@ -485,6 +567,7 @@ export function PerimeterSecurityPanel({
             focusSeq={focusSeq}
             onSelectZone={setSelectedZoneId}
             onEditZone={(eid) => openConfigModal('zones', eid)}
+            onToggleBypass={handleToggleBypass}
             onZoneClick={handleMockZoneClick}
             onFocusStream={onFocusStream}
           />
@@ -512,91 +595,112 @@ export function PerimeterSecurityPanel({
                 const isBypassed = Boolean(z.bypassed);
                 const isSelected = selectedZoneId === z.entity_id;
                 return (
-                  <div
-                    key={z.entity_id}
-                    onClick={() => {
-                      if (snap.is_mock) {
-                        handleMockZoneClick(z.entity_id);
-                      } else {
-                        handleLocateZoneIn3D(z.entity_id);
+                    <div
+                      key={z.entity_id}
+                      onClick={() => {
+                        if (snap.is_mock) {
+                          handleMockZoneClick(z.entity_id);
+                        } else {
+                          handleLocateZoneIn3D(z.entity_id);
+                        }
+                      }}
+                      title={
+                        snap.is_mock
+                          ? `${z.name} (${z.state}) — Click to simulate door/window toggle`
+                          : `Click to locate ${z.name} (${z.state}) on the 3D Spatial House Twin`
                       }
-                    }}
-                    title={
-                      snap.is_mock
-                        ? `${z.name} (${z.state}) — Click to simulate door/window toggle`
-                        : `Click to locate ${z.name} (${z.state}) on the 3D Spatial House Twin`
-                    }
-                    className={`group px-2.5 py-1.5 rounded-md border flex items-center justify-between gap-1.5 text-[11px] cursor-pointer transition-all ${
-                      isSelected ? 'ring-1 ring-cyan-400 ' : ''
-                    }${
-                      isOpen
-                        ? isBypassed
+                      className={`group px-2.5 py-1.5 rounded-md border flex items-center justify-between gap-1.5 text-[11px] cursor-pointer transition-all ${
+                        isSelected ? 'ring-1 ring-cyan-400 ' : ''
+                      }${
+                        isBypassed
                           ? 'bg-amber-950/50 hover:bg-amber-950/70 border-amber-500/60 text-amber-200'
-                          : 'bg-red-950/80 hover:bg-red-950 border-red-500 text-red-100 shadow-[0_0_10px_rgba(239,68,68,0.22)]'
-                        : 'bg-zinc-950/85 hover:bg-zinc-900 hover:border-cyan-400/50 border-emerald-500/20 text-zinc-300'
-                    }`}
-                  >
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span
-                        className={`w-2 h-2 rounded-full shrink-0 ${
-                          isOpen
-                            ? isBypassed
-                              ? 'bg-amber-400'
-                              : 'bg-red-500 animate-ping'
-                            : 'bg-emerald-500'
-                        }`}
-                      />
-                      <span className="truncate font-semibold">{z.name}</span>
-                    </div>
-
-                    <div className="flex items-center gap-1 shrink-0">
-                      {z.battery != null && (
+                          : isOpen
+                          ? 'bg-red-950/80 hover:bg-red-950 border-red-500 text-red-100 shadow-[0_0_10px_rgba(239,68,68,0.22)]'
+                          : 'bg-zinc-950/85 hover:bg-zinc-900 hover:border-cyan-400/50 border-emerald-500/20 text-zinc-300'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 min-w-0">
                         <span
-                          className={`hidden sm:inline-flex items-center gap-0.5 text-[9px] ${
-                            z.battery <= 25 ? 'text-red-400 font-bold' : 'text-zinc-500'
+                          className={`w-2 h-2 rounded-full shrink-0 ${
+                            isBypassed
+                              ? 'bg-amber-400'
+                              : isOpen
+                              ? 'bg-red-500 animate-ping'
+                              : 'bg-emerald-500'
                           }`}
-                        >
-                          <Battery className="w-2.5 h-2.5" />
-                          {z.battery}%
-                        </span>
-                      )}
-                      {snap.is_mock && (
+                        />
+                        <span className="truncate font-semibold">{z.name}</span>
+                      </div>
+
+                      <div className="flex items-center gap-1 shrink-0">
+                        {z.battery != null && (
+                          <span
+                            className={`hidden sm:inline-flex items-center gap-0.5 text-[9px] ${
+                              z.battery <= 25 ? 'text-red-400 font-bold' : 'text-zinc-500'
+                            }`}
+                          >
+                            <Battery className="w-2.5 h-2.5" />
+                            {z.battery}%
+                          </span>
+                        )}
                         <button
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleLocateZoneIn3D(z.entity_id);
+                            handleToggleBypass(z.entity_id);
                           }}
-                          title={`Locate ${z.name} in 3D House Twin`}
-                          className="p-0.5 rounded text-cyan-400 hover:bg-cyan-950/80 cursor-pointer"
+                          title={
+                            isBypassed
+                              ? `Remove bypass on ${z.name}`
+                              : `Bypass ${z.name} (auto-clears once closed)`
+                          }
+                          className={`px-1.5 py-0.5 rounded text-[9px] font-bold border cursor-pointer ${
+                            isBypassed
+                              ? 'bg-amber-500/25 hover:bg-amber-500/40 text-amber-200 border-amber-400/60'
+                              : isOpen
+                              ? 'bg-amber-500 hover:bg-amber-400 text-zinc-950 border-amber-200'
+                              : 'bg-zinc-900 hover:bg-amber-500/20 text-zinc-400 hover:text-amber-300 border-zinc-700 opacity-0 group-hover:opacity-100'
+                          }`}
                         >
-                          <Crosshair className="w-3 h-3" />
+                          {isBypassed ? 'UNBYP' : 'BYPASS'}
                         </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          openConfigModal('zones', z.entity_id);
-                        }}
-                        title={`Rename or change 3D pin for ${z.name}`}
-                        className="p-0.5 rounded text-zinc-500 hover:text-emerald-300 hover:bg-zinc-800 opacity-70 group-hover:opacity-100 cursor-pointer"
-                      >
-                        <Pencil className="w-2.5 h-2.5" />
-                      </button>
-                      <span
-                        className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
-                          isOpen
-                            ? isBypassed
+                        {snap.is_mock && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleLocateZoneIn3D(z.entity_id);
+                            }}
+                            title={`Locate ${z.name} in 3D House Twin`}
+                            className="p-0.5 rounded text-cyan-400 hover:bg-cyan-950/80 cursor-pointer"
+                          >
+                            <Crosshair className="w-3 h-3" />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openConfigModal('zones', z.entity_id);
+                          }}
+                          title={`Rename or change 3D pin for ${z.name}`}
+                          className="p-0.5 rounded text-zinc-500 hover:text-emerald-300 hover:bg-zinc-800 opacity-70 group-hover:opacity-100 cursor-pointer"
+                        >
+                          <Pencil className="w-2.5 h-2.5" />
+                        </button>
+                        <span
+                          className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                            isBypassed
                               ? 'bg-amber-500/25 text-amber-300'
-                              : 'bg-red-600 text-white'
-                            : 'bg-emerald-950/90 text-emerald-400'
-                        }`}
-                      >
-                        {isOpen ? (isBypassed ? 'BYPASS' : 'OPEN') : 'CLOSED'}
-                      </span>
+                              : isOpen
+                              ? 'bg-red-600 text-white'
+                              : 'bg-emerald-950/90 text-emerald-400'
+                          }`}
+                        >
+                          {isBypassed ? 'BYPASS' : isOpen ? 'OPEN' : 'CLOSED'}
+                        </span>
+                      </div>
                     </div>
-                  </div>
                 );
               })}
             </div>

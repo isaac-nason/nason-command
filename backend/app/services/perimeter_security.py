@@ -343,14 +343,16 @@ class PerimeterSecurityService:
         snap = self.get_snapshot()
         zones = snap["zones"]
         open_items = [z for z in zones if z["state"] == "OPEN"]
-        if open_items and not force:
+        unbypassed_open = [z for z in open_items if not z["bypassed"]]
+        if unbypassed_open and not force:
             return {
                 "success": False,
-                "open_zones": [z["name"] for z in open_items],
-                "message": f"Pre-arm check blocked: {len(open_items)} zone(s) currently OPEN.",
+                "open_zones": [z["name"] for z in unbypassed_open],
+                "message": f"Pre-arm check blocked: {len(unbypassed_open)} un-bypassed zone(s) currently OPEN.",
                 "snapshot": snap,
             }
-        self.bypassed_zones = {z["entity_id"] for z in open_items} if force else set()
+        if force:
+            self.bypassed_zones |= {z["entity_id"] for z in open_items}
         self.alarm_state = "armed_night"
         self.armed_via_away = False
         self.triggered_by = None
@@ -361,7 +363,7 @@ class PerimeterSecurityService:
         self._persist_state()
         return {
             "success": True,
-            "bypassed_zones": [z["name"] for z in open_items],
+            "bypassed_zones": [z["name"] for z in zones if z["entity_id"] in self.bypassed_zones],
             "message": "Perimeter ARMED NIGHT.",
             "snapshot": self.get_snapshot(),
         }
@@ -396,6 +398,7 @@ class PerimeterSecurityService:
 
     async def disarm_and_silence(self, reason: str = "Operator disarm") -> dict:
         was_siren_on = self.siren_state == "on" or bool(self.sirens_map)
+        still_open_ids = {z["entity_id"] for z in self._active_zones_list() if z["state"] == "OPEN"}
         self.alarm_state = "disarmed"
         self.siren_state = "off"
         self.triggered_by = None
@@ -403,7 +406,8 @@ class PerimeterSecurityService:
         self.triggered_entity_ids = []
         self.triggered_at = 0.0
         self.siren_silenced_after_timeout = False
-        self.bypassed_zones = set()
+        # Preserve manual bypasses on still-OPEN windows so cracked windows stay bypassed until closed
+        self.bypassed_zones &= still_open_ids
         self.armed_via_away = False
         self.away_grace_until = 0.0
         self._persist_state()
@@ -413,6 +417,65 @@ class PerimeterSecurityService:
 
         print(f"[PERIMETER] Disarmed & silenced ({reason}).")
         return {"success": True, "snapshot": self.get_snapshot()}
+
+    async def _resolve_trigger_after_bypass(self):
+        if self.alarm_state != "triggered":
+            return
+        zones = self._active_zones_list()
+        id_to_name = {z["entity_id"]: z["name"] for z in zones}
+        self.triggered_entity_ids = [
+            zid for zid in self.triggered_entity_ids if zid not in self.bypassed_zones
+        ]
+        bypassed_names_lower = {
+            id_to_name[zid].lower() for zid in self.bypassed_zones if zid in id_to_name
+        }
+        self.triggered_zones = [
+            zn for zn in self.triggered_zones if zn.lower() not in bypassed_names_lower
+        ]
+        unbypassed_open = [z for z in zones if z["state"] == "OPEN" and z["entity_id"] not in self.bypassed_zones]
+        if not self.triggered_zones and not unbypassed_open:
+            was_siren_on = self.siren_state == "on" or bool(self.sirens_map)
+            self.alarm_state = "armed_away" if self.armed_via_away else "armed_night"
+            self.siren_state = "off"
+            self.triggered_by = None
+            self.triggered_at = 0.0
+            self.siren_silenced_after_timeout = False
+            if was_siren_on and self._resolve_transport() != "mock":
+                asyncio.create_task(self._set_hardware_sirens(False))
+        else:
+            self.triggered_by = self._format_triggered_summary()
+
+    async def set_zone_bypass(self, entity_id: str, bypass: bool | None = None) -> dict:
+        zones = self._active_zones_list()
+        target = next((z for z in zones if z["entity_id"] == entity_id), None)
+        if not target:
+            return {"error": "Zone not found", "snapshot": self.get_snapshot()}
+        should_bypass = (entity_id not in self.bypassed_zones) if bypass is None else bool(bypass)
+        if should_bypass:
+            self.bypassed_zones.add(entity_id)
+            await self._resolve_trigger_after_bypass()
+        else:
+            self.bypassed_zones.discard(entity_id)
+        self._persist_state()
+        return {
+            "success": True,
+            "entity_id": entity_id,
+            "bypassed": entity_id in self.bypassed_zones,
+            "snapshot": self.get_snapshot(),
+        }
+
+    async def bypass_all_open_zones(self) -> dict:
+        zones = self._active_zones_list()
+        open_ids = [z["entity_id"] for z in zones if z["state"] == "OPEN"]
+        for zid in open_ids:
+            self.bypassed_zones.add(zid)
+        await self._resolve_trigger_after_bypass()
+        self._persist_state()
+        return {
+            "success": True,
+            "bypassed_count": len(open_ids),
+            "snapshot": self.get_snapshot(),
+        }
 
     async def toggle_mock_zone(self, entity_id: str) -> dict:
         target = next((z for z in self.mock_zones if z["entity_id"] == entity_id), None)

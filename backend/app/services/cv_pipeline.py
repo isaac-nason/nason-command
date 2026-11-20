@@ -471,6 +471,7 @@ class EdgeCVEngine:
         self.away_mode: bool = False
         self.away_armed_at: float = 0.0
         self.mute_until: float = 0.0
+        self.cam_silent_logging: bool = False
         self.zones_lock = threading.Lock()
         self.grabbers: list[LatestFrameGrabber] = []
         self.grabber_map: dict[str, LatestFrameGrabber] = {}
@@ -494,11 +495,19 @@ class EdgeCVEngine:
                 if s in sched_map:
                     self.schedules[s] = dict(sched_map[s])
 
-    def set_away_and_mute_state(self, away_mode: bool, away_armed_at: float = 0.0, mute_until: float = 0.0):
+    def set_away_and_mute_state(
+        self,
+        away_mode: bool,
+        away_armed_at: float = 0.0,
+        mute_until: float = 0.0,
+        cam_silent_logging: bool | None = None,
+    ):
         with self.zones_lock:
             self.away_mode = bool(away_mode)
             self.away_armed_at = float(away_armed_at or 0.0)
             self.mute_until = float(mute_until or 0.0)
+            if cam_silent_logging is not None:
+                self.cam_silent_logging = bool(cam_silent_logging)
 
     def get_schedules_status(self) -> dict[str, dict]:
         now_hm = datetime.now(LOCAL_TZ).strftime("%H:%M")
@@ -952,7 +961,12 @@ async def health_and_sitrep_worker(cv_engine: EdgeCVEngine):
         from app.services.discord_bot import sync_discord_cheatsheet
 
         cfg = await get_push_config()
-        cv_engine.set_away_and_mute_state(cfg.away_mode, cfg.away_armed_at, cfg.mute_until)
+        cv_engine.set_away_and_mute_state(
+            cfg.away_mode,
+            cfg.away_armed_at,
+            cfg.mute_until,
+            bool(getattr(cfg, "cam_silent_logging", False)),
+        )
         if (cfg.discord_webhook or "").startswith("http"):
             await sync_discord_cheatsheet(force_new=False)
         last_boot_ts = os.path.getmtime(boot_marker) if os.path.exists(boot_marker) else 0.0
@@ -971,7 +985,12 @@ async def health_and_sitrep_worker(cv_engine: EdgeCVEngine):
         try:
             now = time.time()
             cfg = await get_push_config()
-            cv_engine.set_away_and_mute_state(cfg.away_mode, cfg.away_armed_at, cfg.mute_until)
+            cv_engine.set_away_and_mute_state(
+                cfg.away_mode,
+                cfg.away_armed_at,
+                cfg.mute_until,
+                bool(getattr(cfg, "cam_silent_logging", False)),
+            )
 
             # 1. RTSP Stream Dropout / Recovery Watchdog (90s threshold)
             for s in cv_engine.streams:

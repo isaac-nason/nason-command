@@ -225,6 +225,7 @@ async def _evaluate_best_confidence_push(
 
             cam_sched = await session.get(_CameraSchedule, ev.camera_id)
             cam_alert_all = bool(cam_sched and getattr(cam_sched, "alert_whitelist", False))
+            cam_log_only = bool(cam_sched and getattr(cam_sched, "silent_logging", False))
             push_cfg = await get_push_config()
 
             win_start = ev.timestamp - _td(seconds=30)
@@ -243,6 +244,16 @@ async def _evaluate_best_confidence_push(
         away_armed_at = float(getattr(push_cfg, "away_armed_at", 0.0) or 0.0)
         in_away_grace = is_away and (now_ts < away_armed_at)
         away_active = is_away and not in_away_grace
+        global_cam_log_only = bool(getattr(push_cfg, "cam_silent_logging", False))
+        perim_triggered = (
+            __import__("app.services.perimeter_security", fromlist=["perimeter_service"]).perimeter_service.alarm_state
+            == "triggered"
+        )
+
+        # Silent Record & Log Mode (per-camera or master header pill): records all clips, Face ID & VLM notes
+        # into Kill-Feed with zero camera push alarms while HOME (auto-arms if AWAY MODE or YoLink Perimeter triggers!)
+        if (global_cam_log_only or cam_log_only) and (not away_active) and (not perim_triggered):
+            return
 
         # 1. Silent Service exemption across encounter window; ISAAC exemption scoped to same person/track
         if any((b.sub_type or "").startswith("🔇 SERVICE:") for b in burst_events):
