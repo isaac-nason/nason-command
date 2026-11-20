@@ -19,6 +19,7 @@ from app.services.cv_pipeline import (
     get_snapshots_storage_mb,
 )
 from app.agent.orchestrator import probe_workstation_ollama, pick_best_vlm
+from app.services.perimeter_security import perimeter_service
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
@@ -72,10 +73,10 @@ COMMAND_REGISTRY: list[dict] = [
         "section": "🛫 Posture & Alert Controls",
         "slash_usage": "/away state:[on | off]",
         "text_usage": "!away [on | off]",
-        "summary": "Arm 24/7 Away Mode across all 3 cameras (or restore 23:30–05:00 PT Home schedules).",
+        "summary": "Arm 24/7 Away Mode across all 3 cameras + 12-zone perimeter (or restore Home Mode).",
         "slash_def": {
             "name": "away",
-            "description": "Arm or disarm 24/7 Away Mode across all cameras",
+            "description": "Arm or disarm 24/7 Away Mode across all cameras and perimeter zones",
             "options": [
                 {
                     "name": "state",
@@ -83,11 +84,60 @@ COMMAND_REGISTRY: list[dict] = [
                     "type": 3,
                     "required": True,
                     "choices": [
-                        {"name": "ON — Arm 24/7 Away Mode", "value": "on"},
-                        {"name": "OFF — Restore Home Schedules", "value": "off"},
+                        {"name": "ON — Arm 24/7 Away Mode + Perimeter", "value": "on"},
+                        {"name": "OFF — Restore Home Schedules & Disarm", "value": "off"},
                     ],
                 }
             ],
+        },
+    },
+    {
+        "name": "night",
+        "aliases": [],
+        "section": "🛡️ Perimeter LoRa Sensors & Siren",
+        "slash_usage": "/night state:[on | force | off]",
+        "text_usage": "!night [on | force | off]",
+        "summary": "Arm Night Perimeter across 12 door/window sensors (auto-disarms 05:00 PT).",
+        "slash_def": {
+            "name": "night",
+            "description": "Arm or disarm Night Perimeter security across all 12 door/window sensors",
+            "options": [
+                {
+                    "name": "state",
+                    "description": "Arm Night (on), Force-Arm bypassing open zones (force), or Disarm (off)",
+                    "type": 3,
+                    "required": True,
+                    "choices": [
+                        {"name": "ON — Pre-check 12 zones & Arm Night", "value": "on"},
+                        {"name": "FORCE — Bypass open zones & Arm Night", "value": "force"},
+                        {"name": "OFF — Disarm & Silence Siren", "value": "off"},
+                    ],
+                }
+            ],
+        },
+    },
+    {
+        "name": "disarm",
+        "aliases": ["silence"],
+        "section": "🛡️ Perimeter LoRa Sensors & Siren",
+        "slash_usage": "/disarm",
+        "text_usage": "!disarm  (or !silence)",
+        "summary": "Immediately disarm perimeter security and kill the Master Bedroom Siren.",
+        "slash_def": {
+            "name": "disarm",
+            "description": "Immediately disarm perimeter security and silence the Master Bedroom Siren",
+        },
+    },
+    {
+        "name": "perimeter",
+        "aliases": ["zones"],
+        "section": "🛡️ Perimeter LoRa Sensors & Siren",
+        "slash_usage": "/perimeter",
+        "text_usage": "!perimeter  (or !zones)",
+        "summary": "Show live OPEN/CLOSED status and battery levels for all 12 door/window zones.",
+        "slash_def": {
+            "name": "perimeter",
+            "description": "Show live OPEN/CLOSED state for all 12 perimeter door and window sensors",
         },
     },
     {
@@ -351,10 +401,12 @@ async def set_away_mode_db(cv_engine: EdgeCVEngine, away: bool, grace_seconds: i
         await session.commit()
         mute_until = float(cfg.mute_until or 0.0)
     cv_engine.set_away_and_mute_state(away, armed_at, mute_until)
+    await perimeter_service.sync_with_away_mode(bool(away), armed_at)
     return {
         "away_mode": bool(away),
         "away_armed_at": armed_at,
         "grace_remaining": max(0, int(round(armed_at - now))),
+        "perimeter": perimeter_service.get_snapshot(),
     }
 
 
@@ -448,20 +500,62 @@ async def _execute_command(
             target = not bool(cfg.away_mode)
 
         await set_away_mode_db(cv_engine, away=target, grace_seconds=0)
+        p_snap = perimeter_service.get_snapshot()
+        byp = f" *(Bypassed open: {', '.join(p_snap['bypassed_zones'])})*" if p_snap.get("bypassed_zones") else ""
         if target:
             return (
-                "🛫 **AWAY MODE ARMED (IMMEDIATE)**\n"
-                "`All 3 cameras (DRIVEWAY, LOFT, LIVING_ROOM) forced to 24/7 recording. "
-                "Alerting on any person, vehicle, delivery, or watchlist match.`",
+                f"🛫 **AWAY MODE + PERIMETER ARMED (IMMEDIATE)**{byp}\n"
+                "`All 3 cameras forced to 24/7 recording + 12-zone door/window siren perimeter locked.`",
                 [],
                 [],
             )
         return (
-            "🏠 **HOME MODE RESTORED**\n"
-            "`Indoor cameras (LOFT, LIVING_ROOM) returned to saved 23:30–05:00 PT schedule.`",
+            "🏠 **HOME MODE RESTORED & PERIMETER DISARMED**\n"
+            "`Indoor cameras returned to saved 23:30–05:00 PT schedule; perimeter disarmed & siren off.`",
             [],
             [],
         )
+
+    if cmd in ("disarm", "silence"):
+        cfg = await get_push_config()
+        if getattr(cfg, "away_mode", False):
+            await set_away_mode_db(cv_engine, away=False, grace_seconds=0)
+        await perimeter_service.disarm_and_silence(reason="Discord /disarm command")
+        return ("🛡️ **PERIMETER DISARMED & SIREN SILENCED**", [], [])
+
+    if cmd == "night":
+        if arg in ("off", "0", "false", "disarm"):
+            await perimeter_service.disarm_and_silence(reason="Discord /night off")
+            return ("🛡️ **NIGHT PERIMETER DISARMED & SIREN SILENCED**", [], [])
+        force = arg == "force"
+        res = await perimeter_service.arm_night(force=force)
+        if not res["success"]:
+            open_list = ", ".join(res["open_zones"])
+            return (
+                f"⚠️ **PRE-ARM BREACH CHECK BLOCKED**\n"
+                f"Open zone(s): **`{open_list}`**\n"
+                "Close them first, or run `/night state:force` (`!night force`) to bypass open zones.",
+                [],
+                [],
+            )
+        byp = f"\nBypassed open zone(s): `{', '.join(res['bypassed_zones'])}`" if res.get("bypassed_zones") else ""
+        return (
+            f"🌙 **PERIMETER ARMED NIGHT** (Auto-Disarm `{res['snapshot']['auto_disarm_time']} PT`){byp}",
+            [],
+            [],
+        )
+
+    if cmd in ("perimeter", "zones"):
+        ps = perimeter_service.get_snapshot()
+        mode_tag = f"{ps['alarm_state'].upper()} | Siren: {ps['siren_state'].upper()} | Link: {ps['transport'].upper()}"
+        z_lines = [
+            f"  [{'OPEN  ' if z['state'] == 'OPEN' else 'CLOSED'}] {z['name']:20s}"
+            + (f" ({z['battery']}%)" if z.get("battery") is not None else "")
+            + (" [BYPASSED]" if z.get("bypassed") else "")
+            for z in ps["zones"]
+        ]
+        body = "\n".join([f"State:    {mode_tag}", f"Open:     {ps['breached_count']}/{ps['total_zones']} zones", *z_lines])
+        return (f"**🛡️ PERIMETER SECURITY // 12-ZONE MATRIX**\n```\n{body}\n```", [], [])
 
     if cmd in ("mute", "snooze"):
         mins = _parse_duration_minutes(arg)
@@ -521,15 +615,22 @@ async def _execute_command(
             if (cfg.mute_until or 0.0) > now_ts
             else "ACTIVE"
         )
+        ps = perimeter_service.get_snapshot()
+        perim_line = (
+            f"{ps['alarm_state'].upper()} ({ps['total_zones'] - ps['breached_count']}/{ps['total_zones']} CLOSED"
+            + (f", OPEN: {', '.join(ps['open_zones'])}" if ps["open_zones"] else "")
+            + f", {ps['transport'].upper()})"
+        )
         body = "\n".join([
-            f"Posture:  {posture} | Push: {mute_info} | Daily Sitrep: {cfg.daily_sitrep_time} PT",
-            f"Cameras:  {' | '.join(cam_parts)}",
-            f"GPU Node: {'ONLINE (' + str(vlm) + ')' if gpu_online else 'OFFLINE / EDGE FALLBACK'}",
-            f"Storage:  {get_snapshots_storage_mb()} MB / 30,720 MB | DB Events: {tot_cnt} | Faces: {len(face_engine.gallery)} | Uptime: {up_str}",
+            f"Posture:   {posture} | Push: {mute_info} | Daily Sitrep: {cfg.daily_sitrep_time} PT",
+            f"Perimeter: {perim_line}",
+            f"Cameras:   {' | '.join(cam_parts)}",
+            f"GPU Node:  {'ONLINE (' + str(vlm) + ')' if gpu_online else 'OFFLINE / EDGE FALLBACK'}",
+            f"Storage:   {get_snapshots_storage_mb()} MB / 30,720 MB | DB Events: {tot_cnt} | Faces: {len(face_engine.gallery)} | Uptime: {up_str}",
             "Recent 5:",
             *recent_lines,
         ])
-        return (f"**📊 COMMAND STATUS // NODE BOSSMAN**\n```yaml\n{body}\n```", [], [])
+        return (f"**📊 COMMAND STATUS // NODE BOSSMAN**\n```\n{body}\n```", [], [])
 
     return ("Unknown command. Type `/help` or `!help` for the full Command Cheat Sheet.", [], [])
 
@@ -590,6 +691,42 @@ async def _handle_slash_interaction(cv_engine: EdgeCVEngine, token: str, d: dict
             json={"type": 5},
         )
         reply_text, files, embeds = await _execute_command(cv_engine, cmd_name, first_arg)
+        payload_obj: dict = {"allowed_mentions": {"parse": []}}
+        if reply_text:
+            payload_obj["content"] = reply_text
+        if embeds:
+            payload_obj["embeds"] = embeds
+        multipart = [(f"files[{i}]", (fn, b, m)) for i, (fn, b, m) in enumerate(files)]
+        edit_url = f"{DISCORD_API_BASE}/webhooks/{app_id}/{inter_token}/messages/@original"
+        if multipart:
+            await client.patch(edit_url, data={"payload_json": json.dumps(payload_obj)}, files=multipart)
+        else:
+            await client.patch(edit_url, json=payload_obj)
+
+
+async def _handle_component_interaction(cv_engine: EdgeCVEngine, d: dict, allowed_guild_id: str | None):
+    if allowed_guild_id and d.get("guild_id") != allowed_guild_id:
+        return
+    inter_id = d.get("id")
+    inter_token = d.get("token")
+    app_id = d.get("application_id")
+    custom_id = ((d.get("data") or {}).get("custom_id") or "").strip()
+
+    cmd_map = {
+        "perim_disarm": ("disarm", ""),
+        "perim_arm_force": ("night", "force"),
+        "perim_snap_all": ("snap", "all"),
+    }
+    if custom_id not in cmd_map:
+        return
+
+    mapped_cmd, mapped_arg = cmd_map[custom_id]
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        await client.post(
+            f"{DISCORD_API_BASE}/interactions/{inter_id}/{inter_token}/callback",
+            json={"type": 5},
+        )
+        reply_text, files, embeds = await _execute_command(cv_engine, mapped_cmd, mapped_arg)
         payload_obj: dict = {"allowed_mentions": {"parse": []}}
         if reply_text:
             payload_obj["content"] = reply_text
@@ -741,6 +878,8 @@ async def discord_bot_worker(cv_engine: EdgeCVEngine):
                                 print(f"[DISCORD BOT] Connected as {bot_name} (slash_commands={slash_ok}, msg_intent={use_message_content_intent})")
                             elif t == "INTERACTION_CREATE" and d.get("type") == 2:
                                 asyncio.create_task(_handle_slash_interaction(cv_engine, token, d, allowed_guild_id))
+                            elif t == "INTERACTION_CREATE" and d.get("type") == 3:
+                                asyncio.create_task(_handle_component_interaction(cv_engine, d, allowed_guild_id))
                             elif t == "MESSAGE_CREATE":
                                 asyncio.create_task(_handle_text_message(cv_engine, token, d, bot_user_id, allowed_guild_id))
                 finally:

@@ -24,8 +24,14 @@ backend/app/models_zoo/*.onnx
 .env
 *.sh
 
-# Plaintext RTSP camera credentials (keep mediamtx.example.yml tracked)
+# Plaintext RTSP & YoLink LoRa credentials (keep example templates tracked)
 mediamtx/mediamtx.yml
+.env.*
+!.env.example
+*perimeter_config*.json
+*perimeter_state*.json
+*yolink*secret*
+*yolink*cred*
 
 # Biometric face crops, taught AI lessons, & binary model weights
 backend/app/known_faces/*

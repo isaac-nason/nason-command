@@ -2,13 +2,14 @@
 <div align="center">
 
 # 🛡️ NASONNATION // COMMAND
-**Low-Latency WebRTC Video Management System (VMS), Edge AI Vision Pipeline & Hybrid Autonomy Command Platform**
+**Low-Latency WebRTC Video Management System (VMS), Edge AI Vision Pipeline, 3D LoRa Perimeter Twin & Hybrid Autonomy Command Platform**
 
 [![React 18](https://img.shields.io/badge/React_18-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)](https://react.dev/)
 [![TypeScript 5](https://img.shields.io/badge/TypeScript_5-007ACC?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Three.js WebGL](https://img.shields.io/badge/Three.js-3D_Spatial_Twin-000000?style=for-the-badge&logo=threedotjs&logoColor=white)](https://threejs.org/)
 [![WebRTC WHEP](https://img.shields.io/badge/WebRTC-WHEP_Sub--250ms-333333?style=for-the-badge&logo=webrtc&logoColor=white)](https://www.ietf.org/archive/id/draft-murillo-whep-03.html)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![YOLOv8s ONNX](https://img.shields.io/badge/YOLOv8s-ONNX_Runtime-FF6F00?style=for-the-badge&logo=onnx&logoColor=white)](https://onnxruntime.ai/)
+[![YOLOv8s ONNX](https://img.shields.io/badge/YOLOv8s-ONNX_Runtime-FF6F00?style=for-the-badge&logo=onnxruntime&logoColor=white)](https://onnxruntime.ai/)
 [![PostgreSQL 16](https://img.shields.io/badge/PostgreSQL_16-316192?style=for-the-badge&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Docker Compose](https://img.shields.io/badge/Docker_Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
@@ -40,14 +41,15 @@ Designed around the constraints of edge hardware, **Command** decouples ultra-lo
 
 ## 🏗️ System Architecture
 
-> 📄 **[Download Full 3-Page System Architecture Specification (PDF)](docs/NasonNation_Command_Architecture_Portfolio.pdf)** — *Includes distributed topology, 6-stage AI/biometric pipeline, 2-way outbound Discord Gateway C2, role-based alert matrix, and dual-disk NAND wear-isolation design.*
+> 📄 **[Download Full 3-Page System Architecture Specification (PDF)](docs/NasonNation_Command_Architecture_Portfolio.pdf)** — *Includes distributed topology, 6-stage AI/biometric pipeline, native 12-zone LoRa perimeter & WebGL 3D Spatial House Twin, 2-way outbound Discord Gateway C2 with 1-tap disarm buttons, role-based alert matrix, and dual-disk NAND wear-isolation design.*
 
 ```mermaid
 flowchart LR
-    subgraph Cameras["Edge Camera Array (ONVIF / RTSP H.264)"]
+    subgraph Cameras["Edge Camera & LoRa Sensor Array"]
         C1["PERIMETER (cam_ext_01) - 24/7 Active + Road Mask + Bumper LPR"]
         C2["INTERIOR_A (cam_int_01) - Configurable Schedule / Away 24/7"]
         C3["INTERIOR_B (cam_int_02) - Configurable Schedule / Away 24/7"]
+        LORA["12-Zone LoRa Door/Window Sensors + Interior Siren (Direct MQTT)"]
     end
 
     subgraph Host["Edge Docker Host (192.168.1.x - Debian Linux / Core i5-6400 / 16GB RAM)"]
@@ -59,6 +61,7 @@ flowchart LR
             YOLO["YOLOv8s ONNX + TrueDisplacement & ParkedVehicleRegistry"]
             FACE["FaceEngine (YuNet + SFace 128-D Cosine Biometrics & RBAC)"]
             ORCH["AI Orchestrator (VLM Deep Inspect, False-Alarm Purge, LPR & HITL Teach)"]
+            PERIM["PerimeterEngine (Zero-HA LoRa MQTT, Night/Away Siren & 16:9 Quad Mosaic)"]
             CONSOL["Best-Confidence Consolidator (4.5s Burst Window / 90s Cooldown)"]
             WATCH["Posture & Health Worker (1-Click Away Mode, Dropout Alerts & Silent Sitrep)"]
             MAINT["6h Self-Healing Worker (30GB Quota, 14d Prune, VACUUM & DR Backups)"]
@@ -66,7 +69,7 @@ flowchart LR
 
         PG[("command-postgres (:5432 PostgreSQL 16 - Tier 1 SATA SSD)")]
         HDD[("Tier 2 1TB 7200RPM HDD (30GB Media Quota, 5s MP4s, Crops & 7d Backups)")]
-        UI["command-frontend (:3000 React + TypeScript + Nginx)"]
+        UI["command-frontend (:3000 React + Three.js + TypeScript + Nginx)"]
     end
 
     subgraph RemoteAI["Dedicated LAN GPU Node (192.168.1.y:11434)"]
@@ -74,34 +77,37 @@ flowchart LR
     end
 
     subgraph External["Zero-Inbound-Port Mobile C2 & Alerting"]
-        PUSH["Multipart HTTPS Webhook (Full Scene + Target/Plate Crops + 5s MP4)"]
-        BOT["2-Way Discord Gateway v10 Bot (/snap, /away, /mute, /status & Auto-Pinned Cheat Sheet)"]
+        PUSH["Multipart HTTPS Alerts (16:9 3-Cam Quad Mosaic + Crops + 5s MP4)"]
+        BOT["2-Way Discord Gateway v10 Bot (/snap, /away, /night, /disarm & 1-Tap Buttons)"]
     end
 
-    subgraph Client["Operator Web Client"]
-        VIEW["React Tactical Matrix (Sub-250ms WebRTC, 1-Click Away Mode, HITL Teach & 24h Heatmap)"]
+    subgraph Client["Operator Web & PWA Client"]
+        VIEW["React Tactical Matrix + WebGL 3D Spatial House Twin (Sub-250ms WebRTC)"]
     end
 
     C1 & C2 & C3 -->|"RTSP TCP"| MTX
+    LORA <-->|"Outbound MQTT :8003 / LAN :18080"| PERIM
     MTX ==>|"DTLS-SRTP UDP :8189"| VIEW
     MTX -->|"Internal RTSP"| FG
     FG --> MOG --> YOLO --> FACE --> ORCH
+    FG -.->|"Stream Health & 3-Cam Breach Mosaic"| PERIM
     FG -.->|"Stream Health"| WATCH
-    YOLO & ORCH <-->|"Async SQL"| PG
-    FG & FACE & MAINT -->|"Sequential I/O"| HDD
+    YOLO & ORCH & PERIM <-->|"Async SQL"| PG
+    FG & FACE & MAINT & PERIM -->|"Sequential I/O"| HDD
     MAINT -->|"VACUUM & Prune"| PG
     ORCH <-->|"LAN HTTP (30s Failover Cache)"| VLM
     ORCH --> CONSOL -->|"Outbound TLS"| PUSH
+    PERIM -->|"1-Tap Disarm + Quad Mosaic"| BOT
     WATCH -->|"Silent Sitrep & Watchdog"| PUSH
     WATCH <-->|"Outbound WSS v10"| BOT
     FG -.->|"On-Demand /snap"| BOT
     UI <-->|"HTTP :3000"| VIEW
-    ORCH <-->|"6.6Hz WS Telemetry & REST :8080"| VIEW
+    ORCH & PERIM <-->|"6.6Hz WS Telemetry & REST :8080"| VIEW
 ```
 
 ---
 
-## 🎯 Core Capabilities (The 6 Tactical Pillars)
+## 🎯 Core Capabilities (The 7 Tactical Pillars)
 
 ### 1. Tactical Corner-Bracket Reticles & Centroid Vector Trails
 * **Euclidean Centroid Slot Locking:** `CameraMotionTracker` matches moving objects across frames by normalized Euclidean distance so `Motion_1` stays locked onto the same physical entity without ID swapping.
@@ -125,8 +131,12 @@ flowchart LR
 * **Parasitic LAN GPU Offload with Edge Failover:** The Debian server stays lightweight by offloading multimodal Vision-Language Model (VLM) inference and license plate OCR over gigabit LAN to an **NVIDIA RTX 3060 Ti** running **Ollama** (`qwen2.5vl:7b` / `qwen2.5:3b`), caching probe state and gracefully degrading to local `YOLOv8s + YuNet/SFace` edge captions if the GPU workstation is asleep.
 * **VLM False-Alarm Purging & 1-Click Active `TEACH`:** Automatically purges inanimate false triggers (`valid_target == false`) before mobile alerts fire, while 1-click corrective UI presets enroll 128-D facial embeddings and inject camera-specific visual rules into subsequent VLM prompts.
 
-### 6. Zero-Port-Forwarding 2-Way Mobile C2, 1-Click `AWAY MODE` & Stream Watchdog
-* **Outbound Discord Gateway v10 Bot (`0` Open Router Ports):** Connects outbound over encrypted WebSocket (`wss://gateway.discord.gg`) scoped strictly to a private guild ID—registering mobile Slash Commands (`/snap`, `/away`, `/mute`, `/unmute`, `/status`, `/sitrep`, `/help`) alongside a SHA-256 hashed, self-updating pinned Command Cheat Sheet.
+### 6. Native 12-Zone LoRa Perimeter Engine & Interactive Three.js 3D Spatial House Twin
+* **Zero-Home-Assistant LoRa MQTT & Siren Driver:** Connects directly from `command-backend` to 12 LoRa door/window sensors and an interior siren over outbound MQTT (`:8003` or air-gapped `:18080` Local Hub)—supporting pre-arm open-zone checks with selective bypass, coupling with `AWAY MODE`, daily `05:00` Night auto-disarm, and `300s` siren auto-cutout.
+* **WebGL Holographic 3D Spatial Twin:** Renders an interactive 2-story architectural wireframe in Three.js with live sensor beacons and camera quick-focus pips. Single-floor breaches automatically isolate the breached story (greying out the inactive floor) and slew onto the open door/window, while simultaneous multi-floor breaches illuminate the full 2-story wireframe with expanding crimson shockwaves.
+
+### 7. Zero-Port-Forwarding 2-Way Mobile C2, 1-Click `AWAY MODE` & Stream Watchdog
+* **Outbound Discord Gateway v10 Bot & 1-Tap Breach Controls (`0` Open Router Ports):** Connects outbound over encrypted WebSocket (`wss://gateway.discord.gg`) scoped strictly to a private guild ID—registering Slash Commands (`/snap`, `/away`, `/night`, `/disarm`, `/perimeter`, `/mute`, `/unmute`, `/status`, `/sitrep`, `/help`) plus 1-tap interactive Discord breach buttons (`DISARM & SILENCE`, `FORCE RE-ARM NIGHT`, `LIVE 3-CAM SNAP`) and a `16:9` 3-camera stitched quad mosaic designed for mobile lock-screen previews.
 * **Non-Destructive `AWAY MODE` & Encounter Consolidation:** Arms 24/7 multi-camera recording and full-property alerting with a configurable exit grace timer while preserving saved Home schedules, consolidating multi-frame encounters into a single highest-confidence Discord push containing wide-scene JPEG, close-up crop, plate crop, and 5-second H.264 MP4 replay.
 * **Self-Healing Watchdog & Silent Daily Sitrep:** Monitors RTSP frame starvation (>90s dropout/recovery alerts), dispatches a scheduled silent multi-camera Sitrep (`SUPPRESS_NOTIFICATIONS`), and runs a 6-hour maintenance loop enforcing a 30 GB Tier-2 HDD media quota, 14-day pruning, `VACUUM ANALYZE`, and rolling `.json.gz` disaster-recovery backups.
 

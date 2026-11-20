@@ -821,6 +821,9 @@ async def periodic_maintenance_worker():
                     ],
                     "delivery_rules": _get_dr(),
                     "ai_lessons": _get_al(),
+                    "perimeter_config": (
+                        __import__("app.services.perimeter_security", fromlist=["perimeter_service"]).perimeter_service.config
+                    ),
                 }
 
             if removed_visitors > 0:
@@ -912,13 +915,19 @@ async def build_and_send_sitrep(
     gpu_str = f"ONLINE ({vlm_name})" if gpu_online else "SLEEP / EDGE-ONLY (YOLOv8s + SFace Active)"
     storage_mb = get_snapshots_storage_mb()
     tot_24h = sum(counts_24h.values())
+    ps = __import__("app.services.perimeter_security", fromlist=["perimeter_service"]).perimeter_service.get_snapshot()
+    perim_str = (
+        f"{ps['alarm_state'].upper()} | {ps['total_zones'] - ps['breached_count']}/{ps['total_zones']} CLOSED"
+        + (f" (OPEN: {', '.join(ps['open_zones'])})" if ps["open_zones"] else "")
+    )
 
     lines = [
-        f"Time:     {now_pt.strftime('%Y-%m-%d %H:%M:%S %Z')}",
-        f"Posture:  {mode_str} | Push: {mute_str}",
-        f"Cameras:  {' | '.join(cam_statuses)}",
-        f"GPU Node: {gpu_str}",
-        f"Storage:  {storage_mb} MB / 30,720 MB HDD | Uptime: {up_d}d {up_h}h {up_m}m",
+        f"Time:      {now_pt.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"Posture:   {mode_str} | Push: {mute_str}",
+        f"Perimeter: {perim_str}",
+        f"Cameras:   {' | '.join(cam_statuses)}",
+        f"GPU Node:  {gpu_str}",
+        f"Storage:   {storage_mb} MB / 30,720 MB HDD | Uptime: {up_d}d {up_h}h {up_m}m",
         (
             f"Last 24h: {tot_24h} events (Person: {counts_24h.get('person', 0)} | "
             f"Delivery: {counts_24h.get('delivery', 0)} | Vehicle: {counts_24h.get('vehicle', 0)} | "

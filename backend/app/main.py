@@ -45,6 +45,7 @@ from app.agent.orchestrator import (
     _event_touches_tripwire,
     _scrub_parked_red_truck,
 )
+from app.services.perimeter_security import perimeter_service
 
 STREAMS = ["annke_1", "tapo_1", "tapo_2"]
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
@@ -341,19 +342,68 @@ async def purge_routine_walkers_and_scrub_notes() -> dict:
     return {"purged_events": purged_count, "freed_mb": freed_mb, "scrubbed_notes": scrubbed_notes}
 
 
+async def purge_perimeter_breach_events() -> dict:
+    purged_rows = 0
+    removed_files = 0
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            select(DetectionEvent).where(
+                (DetectionEvent.motion_slot == "Perimeter")
+                | (DetectionEvent.full_label == "Perimeter_SENSOR_BREACH")
+            )
+        )
+        rows = res.scalars().all()
+        for r in rows:
+            snap_id = (r.attributes or "").split("|")[0].strip() if r.attributes else ""
+            if snap_id and snap_id.endswith(".jpg"):
+                for fp in (f"{SNAPSHOT_DIR}/crop_{snap_id}", f"{SNAPSHOT_DIR}/full_{snap_id}"):
+                    if os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                            removed_files += 1
+                        except OSError:
+                            pass
+            await session.execute(delete(DetectionEvent).where(DetectionEvent.id == r.id))
+            purged_rows += 1
+        await session.commit()
+
+    for orphan_fp in glob.glob(f"{SNAPSHOT_DIR}/*perimeter_*.jpg"):
+        try:
+            os.remove(orphan_fp)
+            removed_files += 1
+        except OSError:
+            pass
+
+    if purged_rows or removed_files:
+        print(f"[PERIMETER CLEANUP] Purged {purged_rows} perimeter breach event(s) and {removed_files} snapshot file(s).")
+    return {"purged_events": purged_rows, "removed_files": removed_files}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     await face_engine.sanitize_gallery_on_startup()
     await _cleanup_recent_headless_false_ids()
     await purge_routine_walkers_and_scrub_notes()
+    test_breach_marker = "/tmp/command_backups/.purged_initial_test_breaches_v74"
+    if not os.path.exists(test_breach_marker):
+        await purge_perimeter_breach_events()
+        try:
+            os.makedirs("/tmp/command_backups", exist_ok=True)
+            with open(test_breach_marker, "w", encoding="utf-8") as mf:
+                mf.write(str(int(time.time())))
+        except OSError:
+            pass
     loop = asyncio.get_running_loop()
     event_queue: asyncio.Queue = asyncio.Queue()
 
     cv_engine = EdgeCVEngine(streams=STREAMS, event_queue=event_queue, loop=loop)
     app.state.cv_engine = cv_engine
+    perimeter_service.bind_cv_engine(cv_engine)
     init_push = await get_push_config()
     cv_engine.set_away_and_mute_state(init_push.away_mode, init_push.away_armed_at, init_push.mute_until)
+    if init_push.away_mode:
+        await perimeter_service.sync_with_away_mode(init_push.away_mode, init_push.away_armed_at)
     await sync_zones_to_engine(cv_engine)
     await sync_schedules_to_engine(cv_engine)
     cv_engine.start()
@@ -364,6 +414,7 @@ async def lifespan(app: FastAPI):
     maint_task = asyncio.create_task(periodic_maintenance_worker())
     health_task = asyncio.create_task(health_and_sitrep_worker(cv_engine))
     bot_task = asyncio.create_task(discord_bot_worker(cv_engine))
+    perim_task = asyncio.create_task(perimeter_service.watchdog_and_mqtt_worker())
     yield
     cv_engine.stop()
     ws_task.cancel()
@@ -372,6 +423,7 @@ async def lifespan(app: FastAPI):
     maint_task.cancel()
     health_task.cancel()
     bot_task.cancel()
+    perim_task.cancel()
 
 
 app = FastAPI(title="NasonNation | Command API", lifespan=lifespan)
@@ -1096,3 +1148,44 @@ async def api_teach_detection(event_id: int, payload: dict):
         "ai_notes": ai_note,
         "lessons_count": len(lessons),
     }
+
+
+# --- v7.4 Native YoLink LoRa Perimeter Security & Siren Endpoints ---
+class ArmNightDTO(BaseModel):
+    force: bool = False
+
+
+@app.get("/api/perimeter/status")
+async def api_perimeter_status():
+    return perimeter_service.get_snapshot()
+
+
+@app.get("/api/perimeter/config")
+async def api_get_perimeter_config():
+    return perimeter_service.get_public_config()
+
+
+@app.post("/api/perimeter/config")
+async def api_save_perimeter_config(payload: dict):
+    return perimeter_service.save_config(payload)
+
+
+@app.post("/api/perimeter/arm-night")
+async def api_perimeter_arm_night(payload: ArmNightDTO):
+    return await perimeter_service.arm_night(force=payload.force)
+
+
+@app.post("/api/perimeter/disarm")
+async def api_perimeter_disarm():
+    return await perimeter_service.disarm_and_silence(reason="Dashboard DISARM & SILENCE")
+
+
+@app.post("/api/perimeter/mock-toggle/{entity_id}")
+async def api_perimeter_mock_toggle(entity_id: str):
+    return await perimeter_service.toggle_mock_zone(entity_id)
+
+
+@app.post("/api/perimeter/purge-breaches")
+async def api_perimeter_purge_breaches():
+    return await purge_perimeter_breach_events()
+

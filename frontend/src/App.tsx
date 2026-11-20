@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useTelemetryWs } from './hooks/useTelemetryWs';
 import { StatusHeader } from './components/StatusHeader';
 import { VideoTile } from './components/VideoTile';
@@ -6,6 +6,7 @@ import { EvidenceRail } from './components/EvidenceRail';
 import { FaceGallery } from './components/FaceGallery';
 import { CommandPrompt } from './components/CommandPrompt';
 import { OperatorCheatSheetModal } from './components/OperatorCheatSheetModal';
+import { PerimeterSecurityPanel } from './components/PerimeterSecurityPanel';
 import type { CameraScheduleConfig, CameraZone } from './types/telemetry';
 import { BookOpen, Camera, Eye, LayoutGrid, PanelRightClose, PanelRightOpen, Users } from 'lucide-react';
 
@@ -28,6 +29,7 @@ export default function App() {
   const [zonesByCam, setZonesByCam] = useState<Record<string, CameraZone[]>>({});
   const [schedules, setSchedules] = useState<Record<string, CameraScheduleConfig>>({});
   const detections = telemetry?.detections || {};
+  const triggerRailRefresh = useCallback(() => setRailRefresh((prev) => prev + 1), []);
 
   useEffect(() => {
     fetch(`http://${HOST_IP}:8080/api/zones`)
@@ -129,6 +131,17 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          <PerimeterSecurityPanel
+            hostIp={HOST_IP}
+            perimeter={telemetry?.perimeter}
+            onRefreshKillFeed={triggerRailRefresh}
+            onFocusStream={(s) => {
+              setFocusedStream(s);
+              setDesktopView('matrix');
+              setMobileTab('feeds');
+            }}
+          />
 
           {desktopView === 'faces' || mobileTab === 'faces' ? (
             <FaceGallery hostIp={HOST_IP} />

@@ -63,7 +63,13 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - MEDIAMTX_RTSP_BASE=rtsp://mediamtx:8554
+      - HOST_LAN_IP=${HOST_LAN_IP:-192.168.1.27}
+      - COMMAND_UI_URL=${COMMAND_UI_URL:-}
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - YOLINK_MODE=${YOLINK_MODE:-auto}
+      - YOLINK_UAID=${YOLINK_UAID:-}
+      - YOLINK_SECRET_KEY=${YOLINK_SECRET_KEY:-}
+      - YOLINK_LOCAL_HUB_IP=${YOLINK_LOCAL_HUB_IP:-}
     ports:
       - "8080:8080"
     healthcheck:

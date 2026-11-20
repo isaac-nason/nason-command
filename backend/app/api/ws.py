@@ -32,6 +32,7 @@ manager = ConnectionManager()
 
 async def telemetry_and_cv_broadcaster(cv_engine):
     from app.services.discord_bot import discord_bot_state
+    from app.services.perimeter_security import perimeter_service
 
     while True:
         now = time.time()
@@ -49,6 +50,7 @@ async def telemetry_and_cv_broadcaster(cv_engine):
             "away_grace_remaining": max(0, int(round(away_armed_at - now))) if away_mode else 0,
             "mute_remaining": max(0, int(round(mute_until - now))),
             "bot_connected": bool(discord_bot_state.get("connected", False)),
+            "perimeter": perimeter_service.get_snapshot(),
             "detections": cv_engine.latest_detections,
         }
         await manager.broadcast_json(payload)

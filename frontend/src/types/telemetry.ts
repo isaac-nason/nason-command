@@ -73,6 +73,40 @@ export interface PersistedDetectionEvent {
   ai_notes?: string | null;
 }
 
+export interface PerimeterZone {
+  entity_id: string;
+  name: string;
+  raw_name?: string;
+  pin_id?: string | null;
+  state: 'OPEN' | 'CLOSED';
+  battery?: number | null;
+  online: boolean;
+  bypassed?: boolean;
+  updated_at?: string | null;
+}
+
+export interface PerimeterSnapshot {
+  online: boolean;
+  is_mock: boolean;
+  transport: 'yolink_local' | 'yolink_cloud' | 'mock';
+  mqtt_live: boolean;
+  alarm_state: 'disarmed' | 'armed_night' | 'armed_away' | 'arming' | 'triggered';
+  siren_state: 'on' | 'off';
+  siren_name: string;
+  breached_count: number;
+  total_zones: number;
+  open_zones: string[];
+  bypassed_zones: string[];
+  triggered_by: string | null;
+  triggered_zones?: string[];
+  triggered_entity_ids?: string[];
+  auto_disarm_enabled: boolean;
+  auto_disarm_time: string;
+  away_grace_remaining: number;
+  last_error: string | null;
+  zones: PerimeterZone[];
+}
+
 export interface TelemetryHeartbeat {
   type: 'HEARTBEAT' | 'PONG';
   timestamp: string;
@@ -83,6 +117,7 @@ export interface TelemetryHeartbeat {
   away_grace_remaining?: number;
   mute_remaining?: number;
   bot_connected?: boolean;
+  perimeter?: PerimeterSnapshot;
   detections?: Record<string, BoundingBoxDetection[]>;
 }
 
