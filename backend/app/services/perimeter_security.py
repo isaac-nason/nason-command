@@ -530,7 +530,82 @@ class PerimeterSecurityService:
                     asyncio.create_task(self._set_hardware_sirens(True))
                 asyncio.create_task(self._dispatch_breach_alert(zone_name, multi_label))
 
-    async def _dispatch_breach_alert(self, zone_name: str, prior_mode: str):
+    async def trigger_indoor_camera_alarm(
+        self,
+        camera_id: str,
+        cam_friendly: str,
+        summary_note: str = "",
+    ) -> bool:
+        """
+        Fires the Master Bedroom Siren + 3D Breach state strictly when an INDOOR camera
+        (tapo_1 = LOFT, tapo_2 = LIVING_ROOM) detects a verified person while ARMED AWAY.
+        Driveway camera (annke_1) and ARMED NIGHT mode NEVER trigger the siren via cameras.
+        """
+        if camera_id not in ("tapo_1", "tapo_2"):
+            return False
+
+        entity_id = f"cam.{camera_id}"
+        zone_label = f"Indoor Cam: {cam_friendly}"
+        if entity_id in self.bypassed_zones:
+            return False
+
+        if self.alarm_state == "armed_away":
+            prior_mode = self.alarm_state
+            self.alarm_state = "triggered"
+            self.siren_state = "on"
+            self.triggered_zones = [zone_label]
+            self.triggered_entity_ids = [entity_id]
+            self.triggered_by = self._format_triggered_summary()
+            self.triggered_at = time.time()
+            self.siren_silenced_after_timeout = False
+            self._persist_state()
+            print(f"[PERIMETER INDOOR CAM BREACH] {zone_label} detected person while ARMED AWAY! Firing siren.")
+            if self._resolve_transport() != "mock":
+                asyncio.create_task(self._set_hardware_sirens(True))
+            asyncio.create_task(
+                self._dispatch_breach_alert(
+                    zone_label,
+                    prior_mode,
+                    record_db_card=False,
+                    extra_detail=summary_note,
+                )
+            )
+            return True
+
+        if (
+            self.alarm_state == "triggered"
+            and self.armed_via_away
+            and entity_id not in self.triggered_entity_ids
+            and zone_label not in self.triggered_zones
+        ):
+            self.triggered_zones.append(zone_label)
+            self.triggered_entity_ids.append(entity_id)
+            self.triggered_by = self._format_triggered_summary()
+            self.siren_state = "on"
+            self.triggered_at = time.time()
+            self.siren_silenced_after_timeout = False
+            self._persist_state()
+            if self._resolve_transport() != "mock":
+                asyncio.create_task(self._set_hardware_sirens(True))
+            asyncio.create_task(
+                self._dispatch_breach_alert(
+                    zone_label,
+                    f"multi_zone_{len(self.triggered_zones)}_breached",
+                    record_db_card=False,
+                    extra_detail=summary_note,
+                )
+            )
+            return True
+
+        return False
+
+    async def _dispatch_breach_alert(
+        self,
+        zone_name: str,
+        prior_mode: str,
+        record_db_card: bool = True,
+        extra_detail: str = "",
+    ):
         try:
             from app.db.session import AsyncSessionLocal
             from app.db.models import DetectionEvent
@@ -540,7 +615,9 @@ class PerimeterSecurityService:
             now_pt = datetime.now(LOCAL_TZ)
             stamp = now_pt.strftime("%H:%M:%S PT")
             ui_url = get_command_ui_url()
-            note = f"🚨 [PERIMETER SIREN TRIGGERED] '{zone_name}' opened while {prior_mode.upper()} at {stamp}."
+            note = f"🚨 [PERIMETER SIREN TRIGGERED] '{zone_name}' triggered while {prior_mode.upper()} at {stamp}."
+            if extra_detail:
+                note = f"{note} ({extra_detail[:110]})"
 
             files_data: list[tuple[str, bytes, str]] = []
             if self._cv_engine:
@@ -612,24 +689,25 @@ class PerimeterSecurityService:
                 except OSError:
                     snap_id = ""
 
-            async with AsyncSessionLocal() as session:
-                ev = DetectionEvent(
-                    timestamp=datetime.now(timezone.utc),
-                    camera_id="annke_1",
-                    motion_slot="Perimeter",
-                    category="person",
-                    sub_type=f"🚨 PERIMETER: {zone_name.upper()}"[:120],
-                    full_label="Perimeter_SENSOR_BREACH",
-                    confidence=1.0,
-                    bbox_x=0.0,
-                    bbox_y=0.0,
-                    bbox_w=0.0,
-                    bbox_h=0.0,
-                    attributes=(f"{snap_id}|{note}" if snap_id else f"|{note}")[:250],
-                    ai_notes=note,
-                )
-                session.add(ev)
-                await session.commit()
+            if record_db_card:
+                async with AsyncSessionLocal() as session:
+                    ev = DetectionEvent(
+                        timestamp=datetime.now(timezone.utc),
+                        camera_id="annke_1",
+                        motion_slot="Perimeter",
+                        category="person",
+                        sub_type=f"🚨 PERIMETER: {zone_name.upper()}"[:120],
+                        full_label="Perimeter_SENSOR_BREACH",
+                        confidence=1.0,
+                        bbox_x=0.0,
+                        bbox_y=0.0,
+                        bbox_w=0.0,
+                        bbox_h=0.0,
+                        attributes=(f"{snap_id}|{note}" if snap_id else f"|{note}")[:250],
+                        ai_notes=note,
+                    )
+                    session.add(ev)
+                    await session.commit()
 
             # Do not spam @everyone push alerts on simulated Mock clicks; real YoLink breaches always alert
             if self._resolve_transport() == "mock":

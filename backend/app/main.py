@@ -617,11 +617,36 @@ async def drain_reviewed_action_queue() -> dict | None:
                 except Exception as enr_err:
                     enrolled_results.append({"event_id": int(ev_id), "error": str(enr_err)})
 
-        # 2. Optionally reconcile resident vehicles
+        # 2. Optionally teach/relabel reviewed items (e.g. food delivery courier)
+        taught_results: list[dict] = []
+        for t_item in payload.get("teach_items") or []:
+            ev_id = t_item.get("event_id")
+            snap_id = str(t_item.get("snap_id") or "").strip()
+            if not ev_id and snap_id:
+                async with AsyncSessionLocal() as session:
+                    r_ev = await session.execute(
+                        select(DetectionEvent.id).where(DetectionEvent.attributes.like(f"{snap_id}%")).limit(1)
+                    )
+                    ev_id = r_ev.scalar_one_or_none()
+            if ev_id:
+                try:
+                    t_res = await api_teach_detection(
+                        int(ev_id),
+                        {
+                            "category": t_item.get("category", "delivery"),
+                            "sub_type": t_item.get("sub_type", "FOOD_DELIVERY"),
+                            "note": t_item.get("note", ""),
+                        },
+                    )
+                    taught_results.append(t_res)
+                except Exception as t_err:
+                    taught_results.append({"event_id": int(ev_id), "error": str(t_err)})
+
+        # 3. Optionally reconcile resident vehicles
         if payload.get("reconcile_resident_vehicles"):
             reconciled_vehicles = await reconcile_resident_vehicle_events()
 
-        # 3. Delete reviewed unnecessary detections + disk files
+        # 4. Delete reviewed unnecessary detections + disk files
         delete_stats = await delete_detection_events(
             ids=payload.get("delete_ids") or [],
             snap_ids=payload.get("delete_snap_ids") or [],
@@ -630,6 +655,7 @@ async def drain_reviewed_action_queue() -> dict | None:
         receipt = {
             "processed_at": datetime.now(timezone.utc).isoformat(),
             "enrolled": enrolled_results,
+            "taught": taught_results,
             "reconciled_vehicles": reconciled_vehicles,
             "delete_stats": delete_stats,
         }

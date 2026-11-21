@@ -73,7 +73,7 @@ COMMAND_REGISTRY: list[dict] = [
         "section": "🛫 Posture & Alert Controls",
         "slash_usage": "/away state:[on | off]",
         "text_usage": "!away [on | off]",
-        "summary": "Arm 24/7 Away Mode across all 3 cameras + 12-zone perimeter (or restore Home Mode).",
+        "summary": "Arm 24/7 Away Mode (12 door/window sensors + indoor Loft/Living cams trigger siren; Driveway alerts without siren).",
         "slash_def": {
             "name": "away",
             "description": "Arm or disarm 24/7 Away Mode across all cameras and perimeter zones",
@@ -97,7 +97,7 @@ COMMAND_REGISTRY: list[dict] = [
         "section": "🛡️ Perimeter LoRa Sensors & Siren",
         "slash_usage": "/night state:[on | force | off]",
         "text_usage": "!night [on | force | off]",
-        "summary": "Arm Night Perimeter across 12 door/window sensors (auto-disarms 05:00 PT).",
+        "summary": "Arm Night Perimeter (12 door/window sensors ONLY trigger siren; all cameras record silently overnight until 05:00 PT).",
         "slash_def": {
             "name": "night",
             "description": "Arm or disarm Night Perimeter security across all 12 door/window sensors",

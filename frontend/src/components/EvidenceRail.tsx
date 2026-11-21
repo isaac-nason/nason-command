@@ -53,6 +53,7 @@ const TEACH_PRESETS: Record<string, { label: string; value: string }[]> = {
     { label: '👤 STRANGER', value: 'person' },
   ],
   delivery: [
+    { label: '🍕 FOOD / DOORDASH', value: 'FOOD_DELIVERY' },
     { label: '📦 AMAZON', value: 'AMAZON' },
     { label: '📦 UPS', value: 'UPS' },
     { label: '📦 FEDEX', value: 'FEDEX' },

@@ -369,11 +369,11 @@ export function PerimeterSecurityPanel({
   } else if (alarmState === 'armed_night') {
     bannerStyle =
       'bg-sky-500/20 text-sky-300 border-sky-400/50 shadow-[0_0_12px_rgba(56,189,248,0.25)]';
-    bannerText = '🌙 ARMED NIGHT';
+    bannerText = '🌙 ARMED NIGHT · SENSORS ONLY (CAMS SILENT)';
   } else if (alarmState === 'armed_away') {
     bannerStyle =
       'bg-amber-500/20 text-amber-300 border-amber-400/50 shadow-[0_0_12px_rgba(245,158,11,0.25)]';
-    bannerText = '🛫 ARMED AWAY';
+    bannerText = '🛫 ARMED AWAY · SENSORS + INDOOR CAMS';
   } else if (isArming) {
     bannerStyle = 'bg-amber-500/20 text-amber-300 border-amber-400/50 animate-pulse';
     bannerText = `⏳ ARMING (${formatGrace(snap.away_grace_remaining)})`;

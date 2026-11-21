@@ -43,6 +43,15 @@ DEFAULT_RULES = [
         "last_seen": None,
     },
     {
+        "id": "FOOD_DELIVERY",
+        "name": "FOOD_DELIVERY",
+        "kind": "carrier",
+        "alert_mode": "alert",
+        "cues": "Un-uniformed DoorDash/UberEats/Grubhub/Papa Johns/pizza or grocery courier in casual street clothes walking up driveway from the street carrying an insulated red/black thermal pizza/food bag, flat horizontal cardboard pizza box(es), sealed brown kraft or tied plastic restaurant takeout bag, or multi-cup drink carrier (often holding phone for drop-off photo)",
+        "sightings": 0,
+        "last_seen": None,
+    },
+    {
         "id": "LANDSCAPERS",
         "name": "LANDSCAPERS",
         "kind": "service",

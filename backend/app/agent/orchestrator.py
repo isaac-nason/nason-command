@@ -273,10 +273,13 @@ async def _evaluate_best_confidence_push(
         in_away_grace = is_away and (now_ts < away_armed_at)
         away_active = is_away and not in_away_grace
         global_cam_log_only = bool(getattr(push_cfg, "cam_silent_logging", False))
-        perim_triggered = (
-            __import__("app.services.perimeter_security", fromlist=["perimeter_service"]).perimeter_service.alarm_state
-            == "triggered"
-        )
+        perim_svc = __import__("app.services.perimeter_security", fromlist=["perimeter_service"]).perimeter_service
+        perim_state = perim_svc.alarm_state
+        perim_triggered = perim_state == "triggered"
+
+        # ARMED NIGHT: Cameras NEVER trigger alarms or push alerts period — ONLY physical door/window sensors set off the alarm!
+        if perim_state == "armed_night":
+            return
 
         # Silent Record & Log Mode (per-camera or master header pill): records all clips, Face ID & VLM notes
         # into Kill-Feed with zero camera push alarms while HOME (auto-arms if AWAY MODE or YoLink Perimeter triggers!)
@@ -385,14 +388,31 @@ async def _evaluate_best_confidence_push(
                 dedup_key=dedup_key,
             )
         elif away_active:
+            # In AWAY MODE, ONLY indoor cameras (tapo_1 = LOFT, tapo_2 = LIVING_ROOM) trigger the Master Bedroom Siren
+            # on verified person detections (never annke_1 DRIVEWAY, and never stray animals).
+            siren_fired = False
+            if is_indoor_cam and ev.category == "person" and not is_family_whitelist:
+                siren_fired = await perim_svc.trigger_indoor_camera_alarm(
+                    ev.camera_id,
+                    cam_friendly,
+                    ai_notes_out or ev.full_label,
+                )
             if is_delivery_alert:
                 title_str = f"🛫 {ev.sub_type} // {cam_friendly}"
                 prio_str = "high"
                 tag_str = "package,airplane"
-            elif is_breach or is_indoor_cam:
-                title_str = f"🚨 AWAY INTRUSION: {(ev.sub_type or ev.category).upper()} // {cam_friendly}"
+            elif is_indoor_cam and ev.category == "person":
+                title_str = (
+                    f"🚨 AWAY INDOOR SIREN TRIGGERED: {(ev.sub_type or 'PERSON').upper()} // {cam_friendly}"
+                    if siren_fired
+                    else f"🚨 AWAY INTRUSION: {(ev.sub_type or ev.category).upper()} // {cam_friendly}"
+                )
                 prio_str = "urgent"
                 tag_str = "rotating_light,shield"
+            elif is_breach:
+                title_str = f"🛫 AWAY DRIVEWAY ALERT: {(ev.sub_type or ev.category).upper()} // {cam_friendly}"
+                prio_str = "high"
+                tag_str = "shield,airplane"
             else:
                 title_str = f"🛫 AWAY ALERT: {(ev.sub_type or ev.category).upper()} // {cam_friendly}"
                 prio_str = "high"
@@ -590,6 +610,21 @@ async def deep_inspect_detection(event_id: int) -> dict:
 
                     resident_veh_list = _load_resident_vehicles()
                     resident_veh_hint = ""
+                    recent_household_car_arrival = False
+                    if ev.camera_id == "annke_1" and ev.timestamp:
+                        hh_q = await session.execute(
+                            select(DetectionEvent.id)
+                            .where(
+                                DetectionEvent.camera_id == "annke_1",
+                                DetectionEvent.category == "vehicle",
+                                DetectionEvent.sub_type.like("🏠%"),
+                                DetectionEvent.timestamp >= ev.timestamp - _td(minutes=6),
+                                DetectionEvent.timestamp <= ev.timestamp + _td(seconds=30),
+                            )
+                            .limit(1)
+                        )
+                        recent_household_car_arrival = hh_q.scalar_one_or_none() is not None
+
                     if ev.camera_id == "annke_1" and resident_veh_list:
                         rv_parts = [
                             f"{rv.get('owner')}'s {rv.get('vehicle_label', 'vehicle')} (plate '{rv.get('plate')}', {rv.get('visual_cues', '')})"
@@ -601,11 +636,18 @@ async def deep_inspect_detection(event_id: int) -> dict:
                             + ". "
                         )
 
+                    household_unloading_hint = (
+                        "RECENT HOUSEHOLD VEHICLE ARRIVAL: A whitelisted family car just pulled into the driveway moments ago — residents unloading bags, groceries, or kids from the parked driveway SUV are household activity ('category': 'person', 'carrier': 'NONE'), NOT FOOD_DELIVERY. "
+                        if recent_household_car_arrival
+                        else "NO RECENT HOUSEHOLD CAR ARRIVAL: If an un-uniformed person in casual street clothes walks onto the driveway from the street carrying an insulated red/black thermal pizza or food delivery bag (e.g., Papa Johns/DoorDash/Grubhub), flat horizontal cardboard pizza box(es), sealed kraft/plastic restaurant takeout bag, or multi-cup drink carrier (often holding a phone for drop-off confirmation), set 'category' to 'delivery' and 'carrier' to 'FOOD_DELIVERY'. "
+                    )
+
                     prompt = (
                         f"Analyze this security camera image from '{ev.camera_id}' (initial detector guess: category={ev.category}, sub_type={ev.sub_type}). "
                         "For person/delivery detections, Image 1 is the close-up subject crop and Image 2 (if provided) is the full wide scene context. "
                         f"{resident_truck_rule}"
                         f"{resident_veh_hint}"
+                        f"{household_unloading_hint}"
                         f"USER TAUGHT RULES FOR THIS CAMERA: {lessons_text or 'None'}. "
                         f"CONFIGURED DELIVERY/SERVICE RULES: {rules_text}. "
                         "Note: grayscale images are infrared night vision on dry pavement. "
@@ -613,8 +655,8 @@ async def deep_inspect_detection(event_id: int) -> dict:
                         "If a person is walking an animal on a sidewalk/leash, classify sub_type as 'dog' and mention the owner/leash in summary. "
                         "If a small four-legged animal is alone on the driveway/pavement with NO person or leash visible, classify sub_type as 'cat'. "
                         "Always populate 'plate' when ANY moving vehicle (household or visitor) has a legible alphanumeric license plate (on Oregon plates, omit the central tree icon between digits and letters); otherwise set 'plate' to 'NONE'. "
-                        f"If a commercial delivery carrier or service crew (like LANDSCAPERS with mowers/blowers/vests/bandanas or AMAZON/UPS/FEDEX/USPS with branded vest/uniform, high-vis safety vest with handheld delivery scanner phone, delivery van/truck, or shipping box) is visible, set 'carrier' to one of {active_rule_names} (or 'NONE') and note if a package was left. "
-                        "CRITICAL GUARDRAIL: Residents or people in casual clothes rolling wheeled curbside trash, recycling, or yard-waste bins (blue, black, green, or gray plastic carts with lids/wheels) or walking around parked household vehicles without a commercial delivery uniform or delivery van are household activity ('category': 'person', 'carrier': 'NONE') — NEVER classify wheeled blue recycling/trash bins as AMAZON. "
+                        f"If a commercial parcel carrier, food/pizza/DoorDash courier, or service crew (such as LANDSCAPERS with mowers/blowers/vests/bandanas, AMAZON/UPS/FEDEX/USPS with branded vest/uniform/van/shipping parcel, or FOOD_DELIVERY with insulated thermal food/pizza bag, flat pizza box, or restaurant takeout bag + drink carrier) is visible, set 'carrier' to one of {active_rule_names} (or 'NONE') and note what is being delivered. "
+                        "CRITICAL GUARDRAIL: Residents rolling wheeled curbside trash, recycling, or yard-waste bins (blue, black, green, or gray plastic carts with lids/wheels) or carrying open plastic laundry baskets are household activity ('category': 'person', 'carrier': 'NONE') — NEVER classify wheeled blue recycling/trash bins as AMAZON or FOOD_DELIVERY. "
                         "Set 'school_commuter' to true ONLY if the subject is a student/youth wearing a school backpack who is casually walking along the public sidewalk or exiting away toward the street with NO package delivery and NO tampering with vehicles/house. "
                         "Set 'face_visible' to true ONLY if a person's actual facial features (eyes/nose) are clearly visible in Image 1 (the close-up crop); set 'face_visible' to false if walking away, only the back of their head/hoodie/backpack is visible, blurry night silhouette, or head cropped out. "
                         "Respond ONLY with valid JSON: "
@@ -769,6 +811,9 @@ async def deep_inspect_detection(event_id: int) -> dict:
                                                             pass
                                         await session.commit()
                                         return {"id": ev.id, "purged": True, "ai_notes": "Purged routine school-commute backpack walker"}
+                            if carrier == "FOOD_DELIVERY" and recent_household_car_arrival:
+                                carrier = "NONE"
+
                             if carrier in rule_map and face_role != "whitelist":
                                 rule = rule_map[carrier]
                                 _record_delivery_sighting(carrier, _dt.now(_tz.utc).isoformat())
