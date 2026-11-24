@@ -89,7 +89,7 @@ def _scrub_parked_red_truck(text: str) -> str:
 
 
 def _sanitize_plate(raw_plate: str | None, category: str | None) -> str:
-    if (category or "").lower() not in ("vehicle", "delivery"):
+    if (category or "").lower() != "vehicle":
         return ""
     p = (raw_plate or "").strip().upper()
     if not p or any(tok in p for tok in ("NONE", "N/A", "UNKNOWN", "NULL", "ABC123", "1234", "ILLEGIBLE", "OR ")):
@@ -98,6 +98,77 @@ def _sanitize_plate(raw_plate: str | None, category: str | None) -> str:
     if len(alnum.replace(" ", "").replace("-", "")) < 3 or len(alnum) > 10:
         return ""
     return alnum
+
+
+def _is_valid_food_delivery(summary: str, in_tripwire: bool, recent_household_car: bool) -> bool:
+    if not in_tripwire or recent_household_car:
+        return False
+    low = (summary or "").lower()
+    veto_terms = (
+        "child",
+        "toddler",
+        "kid",
+        "laundry",
+        "basket",
+        "trash",
+        "recycling",
+        "car door",
+        "opens ",
+        "opening ",
+        "adjusting ",
+        "exiting ",
+        "entering ",
+        "assisting ",
+        "inspecting ",
+        "shirt",
+        "sidewalk",
+        "leash",
+        "dog",
+    )
+    if any(v in low for v in veto_terms):
+        return False
+    positive_terms = (
+        "thermal",
+        "insulated",
+        "pizza box",
+        "pizza bag",
+        "delivery bag",
+        "hot bag",
+        "takeout bag",
+        "doordash",
+        "courier bag",
+        "red bag",
+        "orange bag",
+    )
+    return any(p in low for p in positive_terms)
+
+
+def _infer_carrier_from_summary(summary: str, active_rule_names: list[str]) -> str:
+    """
+    Deterministic safety net when Qwen2.5-VL explicitly describes a branded carrier vest/uniform/tool
+    in 'summary' (e.g. 'Person wearing Amazon delivery vest walking away') while leaving carrier='NONE'.
+    """
+    low = (summary or "").lower()
+    if not low or any(neg in low for neg in ("not amazon", "no amazon", "recycling bin", "trash bin", "yard-waste")):
+        return "NONE"
+    active = {r.upper() for r in (active_rule_names or [])}
+    if "AMAZON" in active and (
+        "amazon" in low
+        or (
+            any(v in low for v in ("delivery vest", "reflective vest", "blue vest"))
+            and any(p in low for p in ("package", "parcel", "mailer", "box", "delivery"))
+        )
+    ):
+        return "AMAZON"
+    if "UPS" in active and any(k in low for k in ("ups ", "ups driver", "ups vest", "ups uniform", "ups truck")):
+        return "UPS"
+    if "FEDEX" in active and "fedex" in low:
+        return "FEDEX"
+    if "USPS" in active and any(k in low for k in ("usps", "postal carrier", "mail carrier", "mail truck")):
+        return "USPS"
+    if "LANDSCAPERS" in active and any(k in low for k in ("leaf blower", "lawn mower", "string trimmer", "landscap")):
+        return "LANDSCAPERS"
+    return "NONE"
 
 
 def _encode_vlm_image_b64(img_path: str, max_dim: int = 896, quality: int = 84) -> str | None:
@@ -302,6 +373,16 @@ async def _evaluate_best_confidence_push(
             if any(_same_subject_track(ev, b) and _is_whitelist_family_event(b.sub_type, b.full_label) for b in burst_events):
                 return
 
+        # 2b. Never fire a generic 'person' TRIPWIRE BREACH when a sibling frame in the same driveway encounter
+        # is a confirmed delivery/service carrier (e.g. courier vest/logo confirmed walking up or back from porch).
+        if ev.category == "person" and any(
+            b.id != ev.id
+            and b.category == "delivery"
+            and (_same_subject_track(ev, b) or ("BREACH" in (ev.full_label or "")))
+            for b in burst_events
+        ):
+            return
+
         def _cat_group(c: str | None) -> str:
             return "person_or_delivery" if c in ("person", "delivery") else (c or "other")
 
@@ -312,7 +393,7 @@ async def _evaluate_best_confidence_push(
             c_sub = cand.sub_type or ""
             c_lbl = cand.full_label or ""
             if _is_isaac_event(c_sub, c_lbl, cand.ai_notes) or c_sub.startswith("🔇 SERVICE:"):
-                return (False, (0, 0, 0, 0.0, 0))
+                return (False, (0, 0, 0, 0, 0, 0.0, 0))
 
             c_watch = "WATCHLIST" in c_sub or (
                 "watchlist" if cand.id == ev.id and face_role in ("watchlist", "watchlist_auto") else ""
@@ -337,11 +418,15 @@ async def _evaluate_best_confidence_push(
                 ):
                     qualifies = True
 
-            has_id_or_plate = 1 if (c_sub.startswith("ID: ") or "[PLATE:" in c_sub or c_deliv) else 0
+            has_real_id_or_plate = 1 if (
+                "[PLATE:" in c_sub or (c_sub.startswith("ID: ") and "VISITOR_" not in c_sub)
+            ) else 0
             score = (
                 1 if c_watch else 0,
-                1 if (c_breach or c_indoor_stranger or c_deliv) else 0,
-                has_id_or_plate,
+                1 if c_indoor_stranger else 0,
+                1 if c_deliv else 0,
+                1 if c_breach else 0,
+                has_real_id_or_plate,
                 round(float(cand.confidence or 0.0), 4),
                 cand.id,
             )
@@ -631,32 +716,25 @@ async def deep_inspect_detection(event_id: int) -> dict:
                             for rv in resident_veh_list
                         ]
                         resident_veh_hint = (
-                            "KNOWN HOUSEHOLD MOVING VEHICLES (always extract their license plate accurately; ignore the green central Oregon tree graphic between the 3 digits and 3 letters): "
+                            "KNOWN HOUSEHOLD VEHICLES: "
                             + "; ".join(rv_parts)
-                            + ". "
+                            + ". When a household SUV is parked in the driveway, adults/children walking around it, opening/closing its doors, carrying children, carrying laundry baskets/drinks, or loading/unloading items are HOUSEHOLD ACTIVITY ('category': 'person', 'carrier': 'NONE'). "
                         )
-
-                    household_unloading_hint = (
-                        "RECENT HOUSEHOLD VEHICLE ARRIVAL: A whitelisted family car just pulled into the driveway moments ago — residents unloading bags, groceries, or kids from the parked driveway SUV are household activity ('category': 'person', 'carrier': 'NONE'), NOT FOOD_DELIVERY. "
-                        if recent_household_car_arrival
-                        else "NO RECENT HOUSEHOLD CAR ARRIVAL: If an un-uniformed person in casual street clothes walks onto the driveway from the street carrying an insulated red/black thermal pizza or food delivery bag (e.g., Papa Johns/DoorDash/Grubhub), flat horizontal cardboard pizza box(es), sealed kraft/plastic restaurant takeout bag, or multi-cup drink carrier (often holding a phone for drop-off confirmation), set 'category' to 'delivery' and 'carrier' to 'FOOD_DELIVERY'. "
-                    )
 
                     prompt = (
                         f"Analyze this security camera image from '{ev.camera_id}' (initial detector guess: category={ev.category}, sub_type={ev.sub_type}). "
                         "For person/delivery detections, Image 1 is the close-up subject crop and Image 2 (if provided) is the full wide scene context. "
                         f"{resident_truck_rule}"
                         f"{resident_veh_hint}"
-                        f"{household_unloading_hint}"
                         f"USER TAUGHT RULES FOR THIS CAMERA: {lessons_text or 'None'}. "
                         f"CONFIGURED DELIVERY/SERVICE RULES: {rules_text}. "
                         "Note: grayscale images are infrared night vision on dry pavement. "
                         "If this is purely an inanimate false trigger (empty pavement, wind-blown tree/shadow, IR spiderweb, stationary unattended trash bin, or headlight glare with NO actual person, vehicle, or animal present), set 'valid_target' to false and 'category' to 'false_alarm'. "
                         "If a person is walking an animal on a sidewalk/leash, classify sub_type as 'dog' and mention the owner/leash in summary. "
                         "If a small four-legged animal is alone on the driveway/pavement with NO person or leash visible, classify sub_type as 'cat'. "
-                        "Always populate 'plate' when ANY moving vehicle (household or visitor) has a legible alphanumeric license plate (on Oregon plates, omit the central tree icon between digits and letters); otherwise set 'plate' to 'NONE'. "
-                        f"If a commercial parcel carrier, food/pizza/DoorDash courier, or service crew (such as LANDSCAPERS with mowers/blowers/vests/bandanas, AMAZON/UPS/FEDEX/USPS with branded vest/uniform/van/shipping parcel, or FOOD_DELIVERY with insulated thermal food/pizza bag, flat pizza box, or restaurant takeout bag + drink carrier) is visible, set 'carrier' to one of {active_rule_names} (or 'NONE') and note what is being delivered. "
-                        "CRITICAL GUARDRAIL: Residents rolling wheeled curbside trash, recycling, or yard-waste bins (blue, black, green, or gray plastic carts with lids/wheels) or carrying open plastic laundry baskets are household activity ('category': 'person', 'carrier': 'NONE') — NEVER classify wheeled blue recycling/trash bins as AMAZON or FOOD_DELIVERY. "
+                        "Populate 'plate' ONLY when 'category' is 'vehicle' (an actively moving/arriving/departing vehicle with a legible plate; omit the central Oregon tree icon between digits and letters). For all person, delivery, or animal detections, ALWAYS set 'plate' to 'NONE' (NEVER read license plates off parked background cars). "
+                        f"Set 'carrier' to one of {active_rule_names} when clear delivery/service evidence is visible across Image 1 (subject crop) and Image 2 (wide driveway/street context): LANDSCAPERS (mowers/blowers/trimmers/crew vests), AMAZON (Amazon smile arrow logo OR two-tone sky-blue/cyan and dark-navy reflective delivery vest with horizontal silver/grey stripes — even when the chest/back smile logo is covered by a hoodie or held package — especially when carrying a brown cardboard parcel or brown kraft/white padded shipping mailer + handheld phone/scanner, or walking from a commercial cargo/Amazon van stopped at the curb in Image 2), UPS/FEDEX/USPS (branded carrier vest/uniform, delivery van/truck at curb, or shipping parcel + scanner), or FOOD_DELIVERY (ONLY when a courier approaches from the street holding an insulated rectangular red/black thermal pizza/food bag or flat horizontal cardboard pizza boxes — NEVER set FOOD_DELIVERY for empty-handed walkers, children, restaurant logo T-shirts, drinks/cans, laundry baskets, or people interacting with parked driveway cars); otherwise set 'carrier' to 'NONE'. "
+                        "CRITICAL GUARDRAIL: Residents rolling wheeled curbside trash, recycling, or yard-waste bins (blue, black, green, or gray plastic carts with lids/wheels) or carrying open plastic laundry baskets are household activity ('category': 'person', 'carrier': 'NONE'). "
                         "Set 'school_commuter' to true ONLY if the subject is a student/youth wearing a school backpack who is casually walking along the public sidewalk or exiting away toward the street with NO package delivery and NO tampering with vehicles/house. "
                         "Set 'face_visible' to true ONLY if a person's actual facial features (eyes/nose) are clearly visible in Image 1 (the close-up crop); set 'face_visible' to false if walking away, only the back of their head/hoodie/backpack is visible, blurry night silhouette, or head cropped out. "
                         "Respond ONLY with valid JSON: "
@@ -811,14 +889,49 @@ async def deep_inspect_detection(event_id: int) -> dict:
                                                             pass
                                         await session.commit()
                                         return {"id": ev.id, "purged": True, "ai_notes": "Purged routine school-commute backpack walker"}
-                            if carrier == "FOOD_DELIVERY" and recent_household_car_arrival:
+                            if carrier == "NONE" and face_role != "whitelist":
+                                carrier = _infer_carrier_from_summary(summary, active_rule_names)
+                            if carrier == "FOOD_DELIVERY" and not _is_valid_food_delivery(
+                                summary, in_tripwire, recent_household_car_arrival
+                            ):
                                 carrier = "NONE"
 
                             if carrier in rule_map and face_role != "whitelist":
                                 rule = rule_map[carrier]
-                                _record_delivery_sighting(carrier, _dt.now(_tz.utc).isoformat())
+                                recent_same_deliv = False
+                                if ev.timestamp:
+                                    rd_q = await session.execute(
+                                        select(DetectionEvent.id)
+                                        .where(
+                                            DetectionEvent.camera_id == ev.camera_id,
+                                            DetectionEvent.id != ev.id,
+                                            DetectionEvent.category == "delivery",
+                                            DetectionEvent.sub_type.ilike(f"%{carrier}%"),
+                                            DetectionEvent.timestamp >= ev.timestamp - _td(seconds=60),
+                                            DetectionEvent.timestamp <= ev.timestamp + _td(seconds=10),
+                                        )
+                                        .limit(1)
+                                    )
+                                    recent_same_deliv = rd_q.scalar_one_or_none() is not None
+                                if not recent_same_deliv:
+                                    _record_delivery_sighting(carrier, _dt.now(_tz.utc).isoformat())
                                 if face_info and face_info.get("auto_enrolled") and str(face_info.get("name", "")).startswith("VISITOR_"):
-                                    await session.execute(delete(_KnownFace).where(_KnownFace.name == face_info["name"]))
+                                    vf_rows = (
+                                        await session.execute(
+                                            select(_KnownFace).where(_KnownFace.name == face_info["name"])
+                                        )
+                                    ).scalars().all()
+                                    for vf in vf_rows:
+                                        if vf.sample_crop and str(vf.sample_crop).startswith("/face_crops/"):
+                                            dcrop = f"/tmp/command_faces/{os.path.basename(vf.sample_crop)}"
+                                            if os.path.exists(dcrop):
+                                                try:
+                                                    os.remove(dcrop)
+                                                except OSError:
+                                                    pass
+                                        await session.execute(delete(_KnownFace).where(_KnownFace.id == vf.id))
+                                    recognized_face = None
+                                    face_role = None
                                 ev.category = "delivery"
                                 plate_str = f" [PLATE: {plate}]" if plate else ""
                                 if rule.get("alert_mode") == "silent":
@@ -910,6 +1023,61 @@ async def deep_inspect_detection(event_id: int) -> dict:
                     sib.full_label = f"{sib.motion_slot}_{clean_wl}"
                     sib.ai_notes = sib_note
                     sib.attributes = f"{sib_snap}|{sib_note}"[:250] if sib_snap else sib_note[:250]
+
+            # Reconcile earlier driveway 'person' (_BREACH) frames from the same courier visit ([-45s, +5s])
+            # when a delivery/service logo or vest is confirmed as the courier approaches or walks back from the porch.
+            if ev.category == "delivery" and ev.timestamp and (
+                (ev.sub_type or "").startswith("📦 DELIVERY:") or (ev.sub_type or "").startswith("🔇 SERVICE:")
+            ):
+                is_silent_srv = (ev.sub_type or "").startswith("🔇 SERVICE:")
+                clean_car = (
+                    (ev.sub_type or "")
+                    .replace("📦 DELIVERY:", "")
+                    .replace("🔇 SERVICE:", "")
+                    .split("[")[0]
+                    .strip()
+                    .upper()
+                )
+                sib_deliv_res = await session.execute(
+                    select(DetectionEvent).where(
+                        DetectionEvent.camera_id == ev.camera_id,
+                        DetectionEvent.id != ev.id,
+                        DetectionEvent.category == "person",
+                        DetectionEvent.timestamp >= ev.timestamp - _td(seconds=45),
+                        DetectionEvent.timestamp <= ev.timestamp + _td(seconds=5),
+                    )
+                )
+                orphan_visitors: set[str] = set()
+                for sib in sib_deliv_res.scalars().all():
+                    if _is_whitelist_family_event(sib.sub_type, sib.full_label) or "WATCHLIST" in (sib.sub_type or "").upper():
+                        continue
+                    if "BREACH" not in (sib.full_label or "") and sib.motion_slot != ev.motion_slot:
+                        continue
+                    for tok in (sib.sub_type or "").replace("(", " ").replace(")", " ").split():
+                        if tok.startswith("VISITOR_") and ("(1x)" in (sib.sub_type or "") or "Seen 1x" in (sib.ai_notes or "")):
+                            orphan_visitors.add(tok)
+                    sib_snap = (sib.attributes or "").split("|")[0].strip()
+                    sib_prev = re.sub(r"^🧬\s*\[VISITOR_\d+[^\]]*\]\s*", "", (sib.ai_notes or "")).replace("🚨 [BREACH] ", "").strip()
+                    sib_note = f"📦 [Encounter-confirmed {clean_car}] {sib_prev}".strip()
+                    sib.category = "delivery"
+                    sib.sub_type = f"🔇 SERVICE: {clean_car}" if is_silent_srv else f"📦 DELIVERY: {clean_car}"
+                    sib.full_label = f"{sib.motion_slot}_{'SERVICE' if is_silent_srv else 'DELIVERY'}_{clean_car}"
+                    sib.ai_notes = sib_note
+                    sib.attributes = f"{sib_snap}|{sib_note}"[:250] if sib_snap else sib_note[:250]
+
+                for vtok in orphan_visitors:
+                    vf_res = await session.execute(
+                        select(_KnownFace).where(_KnownFace.name == vtok, _KnownFace.role == "visitor", _KnownFace.sightings <= 1)
+                    )
+                    for vf in vf_res.scalars().all():
+                        if vf.sample_crop and str(vf.sample_crop).startswith("/face_crops/"):
+                            dcrop = f"/tmp/command_faces/{os.path.basename(vf.sample_crop)}"
+                            if os.path.exists(dcrop):
+                                try:
+                                    os.remove(dcrop)
+                                except OSError:
+                                    pass
+                        await session.execute(delete(_KnownFace).where(_KnownFace.id == vf.id))
 
             await session.commit()
 

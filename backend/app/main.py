@@ -1031,6 +1031,7 @@ async def enroll_face_from_detection(event_id: int, payload: EnrollFaceDTO):
         if os.path.exists(crop_path):
             vec, _, face_crop = face_engine.extract_person_crop_face(cv2.imread(crop_path), for_enrollment=True)
 
+        ev.category = "person"
         ev.sub_type = f"⚠️ WATCHLIST: {clean_name}" if payload.role == "watchlist" else f"ID: {clean_name}"
         ev.full_label = f"{ev.motion_slot}_{clean_name}"
 
@@ -1524,6 +1525,23 @@ async def api_teach_detection(event_id: int, payload: dict):
                 )
         elif correct_category == "delivery":
             clean_carrier = correct_sub_type.replace("📦 DELIVERY:", "").replace("🔇 SERVICE:", "").strip().upper()
+            if "VISITOR_" in wrong_sub:
+                for token in wrong_sub.replace("(", " ").replace(")", " ").split():
+                    if token.startswith("VISITOR_"):
+                        vf_rows = (
+                            await session.execute(
+                                select(KnownFace).where(KnownFace.name == token, KnownFace.role == "visitor", KnownFace.sightings <= 1)
+                            )
+                        ).scalars().all()
+                        for vf in vf_rows:
+                            if vf.sample_crop and str(vf.sample_crop).startswith("/face_crops/"):
+                                dcrop = f"{FACE_CROPS_DIR}/{os.path.basename(vf.sample_crop)}"
+                                if os.path.exists(dcrop):
+                                    try:
+                                        os.remove(dcrop)
+                                    except OSError:
+                                        pass
+                            await session.execute(delete(KnownFace).where(KnownFace.id == vf.id))
             rule_map = {r["id"]: r for r in get_delivery_rules()}
             rule = rule_map.get(clean_carrier)
             if rule and rule.get("alert_mode") == "silent":
@@ -1594,7 +1612,7 @@ async def api_teach_detection(event_id: int, payload: dict):
         )
         await session.commit()
 
-    if correct_category == "person":
+    if correct_category in ("person", "delivery"):
         await face_engine.sync_gallery_from_db_and_disk()
 
     return {
