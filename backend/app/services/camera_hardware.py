@@ -6,7 +6,7 @@ import random
 import re
 import struct
 import time
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 import xml.etree.ElementTree as ET
 import httpx
 import numpy as np
@@ -786,7 +786,8 @@ class CameraHardwareService:
                     f"POST {uri} HTTP/1.1\r\n"
                     f"Host: {host}:8800\r\n"
                     f"Authorization: {auth_hdr}\r\n"
-                    "Content-Type: multipart/mixed; boundary=--client-stream-boundary--\r\n\r\n"
+                    "Content-Type: multipart/mixed; boundary=--client-stream-boundary--\r\n"
+                    "Content-Length: 0\r\n\r\n"
                 )
                 w2.write(req2.encode("utf-8"))
                 await w2.drain()
@@ -803,11 +804,44 @@ class CameraHardwareService:
                 continue
         return None
 
+    async def _probe_tapo_via_go2rtc(self, host: str, candidates: list[tuple[str, str]], raw_pw: str) -> tuple[str, str] | None:
+        """
+        Uses the embedded go2rtc engine itself (/api/streams?src=_tapo_probe&video=all&audio=all)
+        to verify authentication against Tapo port 8800 using the exact same code path used for talkback.
+        """
+        if not os.path.exists("/usr/local/bin/go2rtc"):
+            return None
+        await self._ensure_go2rtc_running()
+        probe_key = "_tapo_auth_probe"
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            for uname, secret in candidates:
+                src = f"tapo://{uname}:{secret}@{host}" if uname else f"tapo://{quote(raw_pw, safe='')}@{host}"
+                try:
+                    await client.put(f"{GO2RTC_API_BASE}/api/streams", params={"name": probe_key, "src": src})
+                    r = await client.get(
+                        f"{GO2RTC_API_BASE}/api/streams",
+                        params={"src": probe_key, "video": "all", "audio": "all"},
+                    )
+                    try:
+                        await client.delete(f"{GO2RTC_API_BASE}/api/streams", params={"src": probe_key})
+                    except Exception:
+                        pass
+                    if r.status_code == 200:
+                        body = r.json() or {}
+                        prods = body.get("producers") or []
+                        if any(isinstance(p, dict) and p.get("medias") for p in prods):
+                            return (uname or "admin", secret)
+                except Exception:
+                    try:
+                        await client.delete(f"{GO2RTC_API_BASE}/api/streams", params={"src": probe_key})
+                    except Exception:
+                        pass
+        return None
+
     async def set_tapo_cloud_password(self, cloud_password: str) -> dict:
         """
-        Verifies the user's TP-Link/Tapo Cloud password directly against Tapo's port 8800
-        Streamd HTTP Digest server (the exact socket go2rtc uses), then stores ONLY the
-        verified irreversible hash on disk (zero plaintext password stored).
+        Verifies the user's TP-Link/Tapo Cloud password directly through go2rtc + Tapo port 8800
+        Streamd Digest, then stores ONLY the verified irreversible hash on disk (zero plaintext stored).
         """
         pw = (cloud_password or "").strip()
         if not pw:
@@ -831,12 +865,12 @@ class CameraHardwareService:
             cands: list[tuple[str, str]] = [
                 ("admin", sha_up),
                 ("admin", md5_up),
+                ("", sha_up),  # lets go2rtc Dial() autodetect hash from raw_pw in RAM, while saving sha_up on disk
                 ("admin", sha_low),
                 ("admin", md5_low),
             ]
             if rtsp_u and rtsp_u != "admin":
                 cands.extend([(rtsp_u, sha_up), (rtsp_u, md5_up)])
-            # Also support if user pasted an already-computed 64-char SHA256 or 32-char MD5 hex hash
             if re.fullmatch(r"[0-9a-fA-F]{64}", pw) or re.fullmatch(r"[0-9a-fA-F]{32}", pw):
                 cands.insert(0, ("admin", pw.upper()))
 
@@ -851,7 +885,10 @@ class CameraHardwareService:
             except Exception:
                 continue
 
-            matched = await self._verify_tapo_8800_digest(host, cands)
+            matched = await self._probe_tapo_via_go2rtc(host, cands, pw)
+            if not matched:
+                digest_cands = [(u, s) for (u, s) in cands if u]
+                matched = await self._verify_tapo_8800_digest(host, digest_cands)
             if matched:
                 matched_user, matched_secret = matched
                 verified_host = host
