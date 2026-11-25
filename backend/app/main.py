@@ -1695,6 +1695,11 @@ class CameraAudioConfigDTO(BaseModel):
 
 class CameraSpeakDTO(BaseModel):
     text: str
+    voice: str | None = None
+
+
+class CameraVoiceDTO(BaseModel):
+    voice: str
 
 
 class CameraChimeDTO(BaseModel):
@@ -1751,10 +1756,18 @@ async def api_set_camera_audio_config(camera_id: str, payload: CameraAudioConfig
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.post("/api/cameras/tts-voice")
+async def api_set_camera_tts_voice(payload: CameraVoiceDTO):
+    try:
+        return await camera_hardware_service.set_tts_voice(payload.voice)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+
 @app.post("/api/cameras/{camera_id}/speak")
 async def api_camera_speak(camera_id: str, payload: CameraSpeakDTO):
     try:
-        return await camera_hardware_service.speak_text(camera_id, payload.text)
+        return await camera_hardware_service.speak_text(camera_id, payload.text, voice_override=payload.voice)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:

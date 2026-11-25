@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import socket
 import struct
 import time
 from urllib.parse import urlparse, unquote, quote
@@ -26,13 +27,50 @@ LIGHT_MODE_TO_ISAPI = {
 ISAPI_TO_LIGHT_MODE = {v: k for k, v in LIGHT_MODE_TO_ISAPI.items()}
 
 PRESET_VOICE_MESSAGES: dict[str, str] = {
-    "leave_door": "Hello! Please leave the package by the front door. Thank you!",
-    "coming_out": "Hello! Give me just one moment, I am coming right out.",
+    "leave_door": "Hi there! You can leave the package right by the front door. Thank you!",
+    "coming_out": "One sec.",
     "no_soliciting": "No soliciting, thank you. Have a good day.",
-    "dinner_ready": "Hey guys, dinner is ready! Come on down.",
-    "check_in": "Hey! Everything good in there?",
-    "warning": "Warning. You are on security camera and being recorded.",
+    "dinner_ready": "Yo! Dinner is ready.",
+    "check_in": "Hey, everything good?",
+    "warning": "Attention. You are on security camera and being recorded.",
 }
+
+NEURAL_TTS_VOICES: dict[str, dict[str, str]] = {
+    "andrew": {
+        "id": "andrew",
+        "label": "Andrew (US Male · Natural)",
+        "edge_voice": "en-US-AndrewNeural",
+        "rate": "+0%",
+    },
+    "ava": {
+        "id": "ava",
+        "label": "Ava (US Female · Warm)",
+        "edge_voice": "en-US-AvaNeural",
+        "rate": "+0%",
+    },
+    "aria": {
+        "id": "aria",
+        "label": "Aria (US Female · Crisp)",
+        "edge_voice": "en-US-AriaNeural",
+        "rate": "+0%",
+    },
+    "guy": {
+        "id": "guy",
+        "label": "Guy (US Male · Command)",
+        "edge_voice": "en-US-GuyNeural",
+        "rate": "+0%",
+    },
+    "jarvis": {
+        "id": "jarvis",
+        "label": "Jarvis (UK Male · Tactical)",
+        "edge_voice": "en-GB-RyanNeural",
+        "rate": "+0%",
+    },
+}
+DEFAULT_TTS_VOICE = "andrew"
+TTS_CACHE_DIR = "/tmp/command_backups/tts_cache"
+PIPER_BIN_PATH = "/opt/piper/piper"
+PIPER_MODEL_PATH = "/opt/piper/en_US-lessac-medium.onnx"
 
 GO2RTC_API_BASE = "http://127.0.0.1:1984"
 GO2RTC_CFG_PATH = "/tmp/go2rtc_talk.yaml"
@@ -332,6 +370,23 @@ class CameraHardwareService:
             except Exception as e:
                 print(f"[CAM HW INIT WARNING] {cam_id} audio init failed: {e}")
 
+    def get_tts_voice(self) -> str:
+        saved = str(self._saved_state.get("_tts_voice") or DEFAULT_TTS_VOICE).strip().lower()
+        return saved if saved in NEURAL_TTS_VOICES else DEFAULT_TTS_VOICE
+
+    async def set_tts_voice(self, voice_id: str) -> dict:
+        clean = (voice_id or "").strip().lower()
+        if clean not in NEURAL_TTS_VOICES:
+            raise ValueError(f"Unknown voice '{voice_id}'. Available: {list(NEURAL_TTS_VOICES.keys())}")
+        async with self._config_lock:
+            self._saved_state["_tts_voice"] = clean
+            self._save_state()
+        return {
+            "status": "UPDATED",
+            "tts_voice": clean,
+            "voice_label": NEURAL_TTS_VOICES[clean]["label"],
+        }
+
     async def get_status(self, camera_id: str) -> dict:
         info = self.get_camera_cred(camera_id)
         if not info:
@@ -342,6 +397,9 @@ class CameraHardwareService:
                 "supports_two_way_speaker": False,
                 "supports_live_mic": False,
             }
+
+        voices_list = [{"id": k, "label": v["label"]} for k, v in NEURAL_TTS_VOICES.items()]
+        cur_voice = self.get_tts_voice()
 
         if info["vendor"] != "annke_isapi":
             tapo_auth = self._saved_state.get("_tapo_auth") or {}
@@ -358,6 +416,8 @@ class CameraHardwareService:
                 "audio_codec": "PCMA/8000",
                 "speaker_busy": self._speaker_lock.locked(),
                 "presets": list(PRESET_VOICE_MESSAGES.keys()),
+                "tts_voice": cur_voice,
+                "tts_voices": voices_list,
             }
 
         host = info["host"]
@@ -455,6 +515,8 @@ class CameraHardwareService:
             **audio_state,
             "speaker_busy": self._speaker_lock.locked(),
             "presets": list(PRESET_VOICE_MESSAGES.keys()),
+            "tts_voice": cur_voice,
+            "tts_voices": voices_list,
         }
 
     async def set_light_config(
@@ -610,7 +672,12 @@ class CameraHardwareService:
 
         return await self.get_status(camera_id)
 
-    async def _ffmpeg_to_ulaw(self, raw_audio_bytes: bytes) -> bytes:
+    async def _decode_to_speech_pcm16(self, raw_audio_bytes: bytes) -> bytes:
+        """
+        Decodes arbitrary audio (MP3/WAV/WebM/Opus) once into clean 16-bit 8kHz mono PCM (s16le),
+        applying a 220–3400Hz telephony bandpass filter + NumPy soft-knee vocal normalization so
+        speech cuts through small camera speakers with zero clipping or double-companding distortion.
+        """
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-hide_banner",
@@ -623,9 +690,9 @@ class CameraHardwareService:
             "-ar",
             "8000",
             "-af",
-            "highpass=f=160,lowpass=f=3600,volume=1.5",
+            "highpass=f=220,lowpass=f=3400",
             "-f",
-            "mulaw",
+            "s16le",
             "pipe:1",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -633,52 +700,26 @@ class CameraHardwareService:
         )
         out, err = await asyncio.wait_for(proc.communicate(input=raw_audio_bytes), timeout=12.0)
         if proc.returncode != 0 or not out:
-            raise RuntimeError(f"ffmpeg ulaw conversion failed: {err.decode(errors='ignore')[:200]}")
-        # Cap single transmission at 20s (160,000 bytes @ 8kHz)
-        return out[:160000]
+            raise RuntimeError(f"ffmpeg PCM16 decode failed: {err.decode(errors='ignore')[:200]}")
 
-    async def _synthesize_tts_ulaw(self, text: str) -> bytes:
-        clean = re.sub(r"[^\w\s.,!?'-]", " ", (text or "").strip())[:260].strip()
-        if not clean:
-            raise ValueError("Message text cannot be empty")
-        tts_proc = await asyncio.create_subprocess_exec(
-            "espeak-ng",
-            "-v",
-            "en-us",
-            "-s",
-            "158",
-            "-p",
-            "46",
-            "--stdout",
-            clean,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        wav_bytes, tts_err = await asyncio.wait_for(tts_proc.communicate(), timeout=8.0)
-        if tts_proc.returncode != 0 or not wav_bytes:
-            raise RuntimeError(f"espeak-ng synthesis failed: {tts_err.decode(errors='ignore')[:180]}")
-        return await self._ffmpeg_to_ulaw(wav_bytes)
+        # Cap single transmission at 20s (160,000 samples = 320,000 bytes @ 8kHz s16le)
+        out = out[:320000]
+        if len(out) >= 4:
+            arr = np.frombuffer(out[: len(out) - (len(out) % 2)], dtype="<i2").astype(np.float32) / 32768.0
+            peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+            if peak > 1e-4:
+                arr = arr / peak
+                # Gentle broadcast vocal leveling + -54 dBFS comfort-noise floor so camera AEC/squelch
+                # gates never drop quiet mid-sentence consonant transitions ("everything good")
+                arr = (np.tanh(arr * 1.55) / float(np.tanh(1.55))) * 0.80
+                rng = np.random.default_rng(42)
+                arr = arr + rng.normal(0.0, 0.0018, size=arr.shape).astype(np.float32)
+                out = np.clip(arr * 32767.0, -32767, 32767).astype("<i2").tobytes()
+        return out
 
-    async def _synthesize_chime_ulaw(self, style: str = "warning") -> bytes:
-        sr = 8000
-        if style == "polite":
-            # Crisp two-note doorbell chime (E5 -> C5)
-            t1 = np.linspace(0, 0.32, int(sr * 0.32), endpoint=False)
-            t2 = np.linspace(0, 0.48, int(sr * 0.48), endpoint=False)
-            n1 = np.sin(2 * np.pi * 659.25 * t1) * np.exp(-3.5 * t1)
-            n2 = np.sin(2 * np.pi * 523.25 * t2) * np.exp(-2.8 * t2)
-            wave = np.concatenate([n1, np.zeros(int(sr * 0.05)), n2])
-        else:
-            # High-visibility 2.2s dual-tone security siren pulse (880Hz <-> 1245Hz)
-            parts = []
-            seg_t = np.linspace(0, 0.22, int(sr * 0.22), endpoint=False)
-            for idx in range(9):
-                freq = 1245.0 if idx % 2 == 0 else 880.0
-                tone = (0.75 * np.sin(2 * np.pi * freq * seg_t) + 0.25 * np.sin(4 * np.pi * freq * seg_t))
-                parts.append(tone)
-            wave = np.concatenate(parts)
-
-        pcm16 = np.clip(wave * 26000.0, -32767, 32767).astype("<i2").tobytes()
+    async def _pcm16_to_g711(self, pcm16_bytes: bytes, codec: str = "mulaw") -> bytes:
+        fmt = "alaw" if codec == "alaw" else "mulaw"
+        c_name = "pcm_alaw" if codec == "alaw" else "pcm_mulaw"
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-hide_banner",
@@ -692,15 +733,150 @@ class CameraHardwareService:
             "1",
             "-i",
             "pipe:0",
+            "-c:a",
+            c_name,
             "-f",
-            "mulaw",
+            fmt,
             "pipe:1",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(input=pcm16), timeout=6.0)
+        out, err = await asyncio.wait_for(proc.communicate(input=pcm16_bytes), timeout=8.0)
+        if proc.returncode != 0 or not out:
+            raise RuntimeError(f"ffmpeg {fmt} encode failed: {err.decode(errors='ignore')[:160]}")
         return out
+
+    def _prune_tts_cache(self) -> None:
+        try:
+            files = [
+                os.path.join(TTS_CACHE_DIR, f)
+                for f in os.listdir(TTS_CACHE_DIR)
+                if f.endswith(".mp3") or f.endswith(".wav")
+            ]
+            if len(files) > 60:
+                files.sort(key=lambda p: os.path.getmtime(p))
+                for old_p in files[:-50]:
+                    try:
+                        os.remove(old_p)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    async def _synthesize_tts_pcm16(self, text: str, voice_override: str | None = None) -> tuple[bytes, str]:
+        """
+        Synthesizes natural human speech into clean 16-bit 8kHz PCM:
+        1. Primary: Microsoft Neural TTS (edge-tts) with instant HDD cache in /tmp/command_backups/tts_cache
+        2. Offline Fallback A: Local Piper ONNX neural voice (/opt/piper/en_US-lessac-medium.onnx)
+        3. Offline Fallback B: espeak-ng emergency fallback
+        """
+        clean = re.sub(r"[^\w\s.,!?'-]", " ", (text or "").strip())[:260].strip()
+        if not clean:
+            raise ValueError("Message text cannot be empty")
+        # Prevent neural TTS lexicon from spelling 'sec' out loud as 'S-E-C'
+        tts_text = re.sub(r"\bsec\b", "seck", clean, flags=re.IGNORECASE)
+
+        v_id = (voice_override or self.get_tts_voice()).strip().lower()
+        if v_id not in NEURAL_TTS_VOICES:
+            v_id = self.get_tts_voice()
+        v_cfg = NEURAL_TTS_VOICES[v_id]
+
+        os.makedirs(TTS_CACHE_DIR, exist_ok=True)
+        cache_key = hashlib.sha256(f"v3|{v_cfg['edge_voice']}|{v_cfg['rate']}|{tts_text}".encode("utf-8")).hexdigest()[:24]
+        cache_mp3 = os.path.join(TTS_CACHE_DIR, f"{v_id}_{cache_key}.mp3")
+
+        if os.path.exists(cache_mp3) and os.path.getsize(cache_mp3) > 256:
+            with open(cache_mp3, "rb") as f:
+                return (await self._decode_to_speech_pcm16(f.read()), v_id)
+
+        # 1. Primary: edge-tts Neural Voice
+        try:
+            import edge_tts
+
+            comm = edge_tts.Communicate(tts_text, voice=v_cfg["edge_voice"], rate=v_cfg["rate"])
+            mp3_buf = bytearray()
+            async for chunk in comm.stream():
+                if chunk.get("type") == "audio" and chunk.get("data"):
+                    mp3_buf.extend(chunk["data"])
+            if len(mp3_buf) > 256:
+                try:
+                    with open(cache_mp3, "wb") as f:
+                        f.write(mp3_buf)
+                    self._prune_tts_cache()
+                except OSError:
+                    pass
+                return (await self._decode_to_speech_pcm16(bytes(mp3_buf)), v_id)
+        except Exception as edge_err:
+            print(f"[TTS EDGE FALLBACK] {edge_err}")
+
+        # 2. Offline Local Neural Fallback: Piper ONNX
+        if os.path.exists(PIPER_BIN_PATH) and os.path.exists(PIPER_MODEL_PATH):
+            try:
+                wav_tmp = f"/tmp/piper_{os.urandom(4).hex()}.wav"
+                p_proc = await asyncio.create_subprocess_exec(
+                    PIPER_BIN_PATH,
+                    "--model",
+                    PIPER_MODEL_PATH,
+                    "--output_file",
+                    wav_tmp,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, _ = await asyncio.wait_for(p_proc.communicate(input=clean.encode("utf-8")), timeout=8.0)
+                if p_proc.returncode == 0 and os.path.exists(wav_tmp):
+                    with open(wav_tmp, "rb") as wf:
+                        raw_wav = wf.read()
+                    try:
+                        os.remove(wav_tmp)
+                    except OSError:
+                        pass
+                    if len(raw_wav) > 128:
+                        return (await self._decode_to_speech_pcm16(raw_wav), "piper_offline")
+            except Exception as piper_err:
+                print(f"[TTS PIPER FALLBACK] {piper_err}")
+
+        # 3. Last-resort emergency fallback: espeak-ng
+        tts_proc = await asyncio.create_subprocess_exec(
+            "espeak-ng",
+            "-v",
+            "en-us",
+            "-s",
+            "150",
+            "-p",
+            "45",
+            "--stdout",
+            clean,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        wav_bytes, tts_err = await asyncio.wait_for(tts_proc.communicate(), timeout=8.0)
+        if tts_proc.returncode != 0 or not wav_bytes:
+            raise RuntimeError(f"TTS synthesis failed: {tts_err.decode(errors='ignore')[:180]}")
+        return (await self._decode_to_speech_pcm16(wav_bytes), "espeak_fallback")
+
+    async def _synthesize_chime_pcm16(self, style: str = "warning") -> bytes:
+        sr = 8000
+        if style == "polite":
+            # Crisp two-note doorbell chime (E5 -> C5) with smooth cosine attack
+            t1 = np.linspace(0, 0.34, int(sr * 0.34), endpoint=False)
+            t2 = np.linspace(0, 0.50, int(sr * 0.50), endpoint=False)
+            n1 = np.sin(2 * np.pi * 659.25 * t1) * np.exp(-3.4 * t1) * np.minimum(1.0, t1 / 0.01)
+            n2 = np.sin(2 * np.pi * 523.25 * t2) * np.exp(-2.6 * t2) * np.minimum(1.0, t2 / 0.01)
+            wave = np.concatenate([n1, np.zeros(int(sr * 0.06)), n2])
+        else:
+            # High-visibility 2.0s dual-tone security siren pulse (880Hz <-> 1245Hz)
+            parts = []
+            seg_t = np.linspace(0, 0.22, int(sr * 0.22), endpoint=False)
+            env = np.minimum(1.0, seg_t / 0.008) * np.minimum(1.0, (0.22 - seg_t) / 0.008)
+            for idx in range(9):
+                freq = 1245.0 if idx % 2 == 0 else 880.0
+                tone = (0.78 * np.sin(2 * np.pi * freq * seg_t) + 0.22 * np.sin(4 * np.pi * freq * seg_t)) * env
+                parts.append(tone)
+            wave = np.concatenate(parts)
+
+        return np.clip(wave * 22000.0, -32767, 32767).astype("<i2").tobytes()
 
     async def _stream_ulaw_onvif_backchannel(self, info: dict, ulaw_bytes: bytes) -> bool:
         """
@@ -1104,11 +1280,11 @@ class CameraHardwareService:
             "verified_host": verified_host,
         }
 
-    async def _stream_ulaw_tapo_native(self, camera_id: str, info: dict, ulaw_bytes: bytes) -> bool:
+    async def _stream_pcm16_tapo_native(self, camera_id: str, info: dict, pcm16_bytes: bytes) -> bool:
         """
         Native asyncio TP-Link Tapo port 8800 Streamd speaker backchannel (PCMA/8000 in MPEG-TS).
-        Ported from pytapo.media_stream (session.py + talk.py) so Loft & Living Room speakers work
-        reliably on TPAP/V4 firmware without go2rtc socket-close or encrypted-JSON bugs.
+        Encodes clean 16-bit 8kHz PCM directly into A-law (zero double-companding loss), enables
+        TCP_NODELAY, and transmits smooth 640-byte (80ms) PES frames for Wi-Fi jitter immunity.
         """
         tapo_auth = self._saved_state.get("_tapo_auth") or {}
         sha_up = tapo_auth.get("sha256")
@@ -1125,38 +1301,10 @@ class CameraHardwareService:
             if extra_s and (extra_u, extra_s) not in cands:
                 cands.append((extra_u, extra_s))
 
-        # Transcode 8kHz mulaw -> 8kHz mono A-law (PCMA) with 650ms speaker-amp wake delay
-        ff_proc = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "mulaw",
-            "-ar",
-            "8000",
-            "-ac",
-            "1",
-            "-i",
-            "pipe:0",
-            "-af",
-            "adelay=650:all=1",
-            "-ac",
-            "1",
-            "-ar",
-            "8000",
-            "-c:a",
-            "pcm_alaw",
-            "-f",
-            "alaw",
-            "pipe:1",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        alaw_bytes, ff_err = await asyncio.wait_for(ff_proc.communicate(input=ulaw_bytes), timeout=10.0)
-        if ff_proc.returncode != 0 or not alaw_bytes:
-            raise RuntimeError(f"FFmpeg PCMA conversion failed: {ff_err.decode(errors='ignore')[:160]}")
+        # Prepend 650ms of pure 16-bit digital silence so the Tapo speaker amp unmutes before word 1,
+        # plus 160ms trailing silence so the last syllable never clips off early
+        padded_pcm16 = (b"\x00\x00" * 5200) + pcm16_bytes + (b"\x00\x00" * 1280)
+        alaw_bytes = await self._pcm16_to_g711(padded_pcm16, codec="alaw")
 
         host = info["host"]
         sess_tuple, diag = await self._open_tapo_8800_session(host, cands)
@@ -1165,6 +1313,13 @@ class CameraHardwareService:
 
         reader, writer, res_headers, matched_u, matched_s = sess_tuple
         try:
+            raw_sock = writer.get_extra_info("socket")
+            if raw_sock is not None:
+                try:
+                    raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+
             # Derive optional AES-128-CBC key/IV from Key-Exchange header for encrypted JSON control replies
             kx_hdr = res_headers.get("Key-Exchange") or res_headers.get("key-exchange") or ""
             kx_pairs = dict(re.findall(r'([A-Za-z0-9_-]+)="?([^",\s]+)"?', kx_hdr))
@@ -1254,17 +1409,24 @@ class CameraHardwareService:
             )
             await _send_mp2t_part(psi_hdr)
 
-            # Pace 160-byte (20ms @ 8kHz) PCMA frames wrapped in PES + 188-byte MPEG-TS packets
+            # Pre-burst 3 frames (960B = 120ms jitter cushion) immediately, then pace 320B (40ms) frames
+            # against a drift-free monotonic origin so sleep/drain slack never starves the speaker mid-sentence!
+            frame_bytes = 320
+            preburst_bytes = 960
             cc = 0
             samples_sent = 0
             loop = asyncio.get_running_loop()
-            deadline = loop.time()
+            t_origin: float | None = None
 
-            for off in range(0, len(alaw_bytes), 160):
-                chunk_alaw = alaw_bytes[off : off + 160]
-                wait_s = deadline - loop.time()
-                if wait_s > 0:
-                    await asyncio.sleep(wait_s)
+            for off in range(0, len(alaw_bytes), frame_bytes):
+                chunk_alaw = alaw_bytes[off : off + frame_bytes]
+                if samples_sent >= preburst_bytes:
+                    if t_origin is None:
+                        t_origin = loop.time()
+                    target_t = t_origin + (((samples_sent - preburst_bytes) / 8000.0) * 0.985)
+                    wait_s = target_t - loop.time()
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s)
 
                 pts = (samples_sent * 90000 // 8000) & ((1 << 33) - 1)
                 pts_bytes = bytes(
@@ -1295,9 +1457,8 @@ class CameraHardwareService:
 
                 await _send_mp2t_part(bytes(ts_pkts))
                 samples_sent += len(chunk_alaw)
-                deadline = max(deadline + (len(chunk_alaw) / 8000.0), loop.time())
 
-            await asyncio.sleep(0.30)
+            await asyncio.sleep(0.45)
             return True
         finally:
             writer.close()
@@ -1429,24 +1590,25 @@ class CameraHardwareService:
                 except OSError:
                     pass
 
-    async def transmit_ulaw(self, camera_id: str, ulaw_bytes: bytes) -> dict:
+    async def transmit_pcm16(self, camera_id: str, pcm16_bytes: bytes) -> dict:
         info = self.get_camera_cred(camera_id)
         if not info or not info.get("supports_two_way_speaker"):
             raise ValueError(f"Camera '{camera_id}' does not expose a two-way speaker channel")
-        if not ulaw_bytes:
+        if not pcm16_bytes:
             raise ValueError("Empty audio buffer")
 
-        duration_s = round(len(ulaw_bytes) / 8000.0, 2)
+        duration_s = round((len(pcm16_bytes) / 2.0) / 8000.0, 2)
         async with self._speaker_lock:
             if info["vendor"] == "tapo_rtsp":
                 transport_used = "tapo_native_8800"
                 try:
-                    ok = await self._stream_ulaw_tapo_native(camera_id, info, ulaw_bytes)
+                    ok = await self._stream_pcm16_tapo_native(camera_id, info, pcm16_bytes)
                 except Exception as native_err:
                     print(f"[TAPO SPEAKER NATIVE] {camera_id}: {native_err}")
                     if os.path.exists("/usr/local/bin/go2rtc"):
                         transport_used = "tapo_go2rtc_8800"
-                        ok = await self._stream_ulaw_tapo_go2rtc(camera_id, info, ulaw_bytes)
+                        ulaw_fb = await self._pcm16_to_g711(pcm16_bytes, codec="mulaw")
+                        ok = await self._stream_ulaw_tapo_go2rtc(camera_id, info, ulaw_fb)
                     else:
                         raise
                 if not ok:
@@ -1460,6 +1622,7 @@ class CameraHardwareService:
                     "transport": transport_used,
                 }
 
+            ulaw_bytes = await self._pcm16_to_g711(pcm16_bytes, codec="mulaw")
             transport_used = "onvif_backchannel"
             ok = False
             try:
@@ -1482,24 +1645,24 @@ class CameraHardwareService:
             "transport": transport_used,
         }
 
-    async def speak_text(self, camera_id: str, text_or_preset: str) -> dict:
+    async def speak_text(self, camera_id: str, text_or_preset: str, voice_override: str | None = None) -> dict:
         key = (text_or_preset or "").strip().lower()
         spoken_text = PRESET_VOICE_MESSAGES.get(key, text_or_preset.strip())
-        ulaw = await self._synthesize_tts_ulaw(spoken_text)
-        res = await self.transmit_ulaw(camera_id, ulaw)
-        return {**res, "spoken_text": spoken_text}
+        pcm16, engine_used = await self._synthesize_tts_pcm16(spoken_text, voice_override=voice_override)
+        res = await self.transmit_pcm16(camera_id, pcm16)
+        return {**res, "spoken_text": spoken_text, "tts_voice": engine_used}
 
     async def play_chime(self, camera_id: str, style: str = "warning", announce_warning: bool = False) -> dict:
-        ulaw = await self._synthesize_chime_ulaw(style=style)
+        pcm16 = await self._synthesize_chime_pcm16(style=style)
         if announce_warning:
-            voice_ulaw = await self._synthesize_tts_ulaw(PRESET_VOICE_MESSAGES["warning"])
-            ulaw = ulaw + (b"\xff" * 800) + voice_ulaw
-        res = await self.transmit_ulaw(camera_id, ulaw)
+            voice_pcm16, _ = await self._synthesize_tts_pcm16(PRESET_VOICE_MESSAGES["warning"])
+            pcm16 = pcm16 + (b"\x00\x00" * 1200) + voice_pcm16
+        res = await self.transmit_pcm16(camera_id, pcm16)
         return {**res, "style": style}
 
     async def push_to_talk_raw(self, camera_id: str, uploaded_audio_bytes: bytes) -> dict:
-        ulaw = await self._ffmpeg_to_ulaw(uploaded_audio_bytes)
-        return await self.transmit_ulaw(camera_id, ulaw)
+        pcm16 = await self._decode_to_speech_pcm16(uploaded_audio_bytes)
+        return await self.transmit_pcm16(camera_id, pcm16)
 
 
 camera_hardware_service = CameraHardwareService()

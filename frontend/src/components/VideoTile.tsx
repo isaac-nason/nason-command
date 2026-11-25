@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useWhepClient } from '../hooks/useWhepClient';
 import type { BoundingBoxDetection, CameraScheduleConfig, CameraZone, HeatmapPoint, ZonePoint } from '../types/telemetry';
 import { Bell, BellOff, Check, Clock, Crosshair, Database, Eye, EyeOff, Flame, Lightbulb, Maximize2, Mic, Minimize2, Moon, PauseCircle, Radio, RotateCcw, Send, ShieldAlert, ShieldOff, Siren, Sun, Trash2, Volume2, VolumeX, X } from 'lucide-react';
@@ -26,6 +27,8 @@ interface CameraHardwareStatus {
   mic_volume?: number;
   speaker_volume?: number;
   speaker_busy?: boolean;
+  tts_voice?: string;
+  tts_voices?: { id: string; label: string }[];
 }
 
 interface VideoTileProps {
@@ -191,6 +194,19 @@ export function VideoTile({
     refreshHardwareStatus();
   }, [apiBase, streamName]);
 
+  useEffect(() => {
+    if (!showTalkModal && !showLightModal && !showSchedModal) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setShowTalkModal(false);
+        setShowLightModal(false);
+        setShowSchedModal(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showTalkModal, showLightModal, showSchedModal]);
+
   const toggleLiveAudio = () => {
     setLiveAudioOn((prev) => {
       const next = !prev;
@@ -255,6 +271,23 @@ export function VideoTile({
       console.error('Failed to update camera audio config:', err);
     } finally {
       setLightBusy(false);
+    }
+  };
+
+  const changeTtsVoice = async (voiceId: string) => {
+    try {
+      const res = await fetch(`${apiBase}/api/cameras/tts-voice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voice: voiceId }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setHwStatus((prev) => (prev ? { ...prev, tts_voice: data.tts_voice } : prev));
+        setTalkStatusMsg(`Voice: ${data.voice_label}`);
+      }
+    } catch {
+      setTalkStatusMsg('Failed to update voice');
     }
   };
 
@@ -1091,467 +1124,513 @@ export function VideoTile({
         </div>
       </div>
 
-      {showSchedModal && (
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="absolute top-11 right-2 z-30 bg-zinc-950/95 border border-zinc-700 rounded-lg p-3 w-64 shadow-2xl font-mono text-xs space-y-2.5"
-        >
-          <div className="flex items-center justify-between border-b border-zinc-800 pb-1.5">
-            <span className="font-bold text-emerald-400">{title} // SCHEDULE</span>
-            <button onClick={() => setShowSchedModal(false)} className="text-zinc-400 hover:text-white cursor-pointer">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          <div className="grid grid-cols-3 gap-1">
-            <button
-              onClick={() => saveSchedule('always_record')}
-              className={`py-1.5 rounded text-[10px] font-bold border cursor-pointer ${
-                schedMode === 'always_record'
-                  ? 'bg-emerald-600 text-white border-emerald-400'
-                  : 'bg-zinc-900 text-zinc-300 border-zinc-800'
-              }`}
+      {showSchedModal &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            onClick={() => setShowSchedModal(false)}
+            className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/55 backdrop-blur-[2px]"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="bg-zinc-950/95 border border-emerald-500/50 rounded-lg p-3.5 w-full max-w-xs max-h-[90vh] overflow-y-auto shadow-2xl font-mono text-xs space-y-2.5"
             >
-              24/7 REC
-            </button>
-            <button
-              onClick={() => saveSchedule('paused')}
-              className={`py-1.5 rounded text-[10px] font-bold border cursor-pointer ${
-                schedMode === 'paused'
-                  ? 'bg-amber-600 text-white border-amber-400'
-                  : 'bg-zinc-900 text-zinc-300 border-zinc-800'
-              }`}
-            >
-              PAUSE NOW
-            </button>
-            <button
-              onClick={() => setSchedMode('schedule')}
-              className={`py-1.5 rounded text-[10px] font-bold border cursor-pointer ${
-                schedMode === 'schedule'
-                  ? 'bg-sky-600 text-white border-sky-400'
-                  : 'bg-zinc-900 text-zinc-300 border-zinc-800'
-              }`}
-            >
-              SCHEDULE
-            </button>
-          </div>
-
-          {schedMode === 'schedule' && (
-            <div className="space-y-2 pt-1 border-t border-zinc-800">
-              <div className="text-[10px] text-zinc-400">Active Recording Window (PT):</div>
-              <div className="flex items-center justify-between gap-2">
-                <label className="text-[10px] text-zinc-400">START:</label>
-                <input
-                  type="time"
-                  value={schedStart}
-                  onChange={(e) => setSchedStart(e.target.value)}
-                  className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-100"
-                />
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <label className="text-[10px] text-zinc-400">STOP:</label>
-                <input
-                  type="time"
-                  value={schedEnd}
-                  onChange={(e) => setSchedEnd(e.target.value)}
-                  className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-100"
-                />
-              </div>
-              <button
-                onClick={() => saveSchedule('schedule')}
-                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-1.5 rounded text-[11px] cursor-pointer"
-              >
-                SAVE WINDOW
-              </button>
-            </div>
-          )}
-
-          <div className="pt-2 border-t border-zinc-800 space-y-1.5">
-            <div className="text-[10px] font-bold text-zinc-300">CAMERA PUSH POSTURE (HOME):</div>
-            <div className="grid grid-cols-3 gap-1">
-              <button
-                onClick={() => {
-                  setSilentLogging(false);
-                  setAlertWhitelist(false);
-                  saveSchedule(schedMode, false, false);
-                }}
-                className={`py-1 rounded text-[9px] font-bold border cursor-pointer ${
-                  !silentLogging && !alertWhitelist
-                    ? 'bg-emerald-600 text-white border-emerald-400'
-                    : 'bg-zinc-900 text-zinc-400 border-zinc-800'
-                }`}
-              >
-                FAM·SILENT
-              </button>
-              <button
-                onClick={() => {
-                  setSilentLogging(true);
-                  setAlertWhitelist(false);
-                  saveSchedule(schedMode, false, true);
-                }}
-                title="Record & log clips/Face ID silently to Kill-Feed with zero push alarms while HOME"
-                className={`py-1 rounded text-[9px] font-bold border cursor-pointer ${
-                  silentLogging
-                    ? 'bg-violet-600 text-white border-violet-300'
-                    : 'bg-zinc-900 text-zinc-400 border-zinc-800'
-                }`}
-              >
-                LOG·ONLY
-              </button>
-              <button
-                onClick={() => {
-                  setSilentLogging(false);
-                  setAlertWhitelist(true);
-                  saveSchedule(schedMode, true, false);
-                }}
-                className={`py-1 rounded text-[9px] font-bold border cursor-pointer ${
-                  !silentLogging && alertWhitelist
-                    ? 'bg-sky-600 text-white border-sky-400'
-                    : 'bg-zinc-900 text-zinc-400 border-zinc-800'
-                }`}
-              >
-                FAM·ALERT
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showLightModal && hwStatus?.supports_light && (
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="absolute top-11 right-2 z-30 bg-zinc-950/95 border border-zinc-700 rounded-lg p-3 w-72 shadow-2xl font-mono text-xs space-y-2.5"
-        >
-          <div className="flex items-center justify-between border-b border-zinc-800 pb-1.5">
-            <span className="font-bold text-amber-300">{title} // OPTICS & AUDIO</span>
-            <button onClick={() => setShowLightModal(false)} className="text-zinc-400 hover:text-white cursor-pointer">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          <div className="space-y-1.5">
-            <div className="text-[10px] text-zinc-400 font-bold">NIGHT SUPPLEMENT LIGHT MODE:</div>
-            <div className="grid grid-cols-2 gap-1.5">
-              <button
-                disabled={lightBusy}
-                onClick={() => applyLightConfig('ir')}
-                title="Invisible IR LEDs only — White floodlight NEVER turns on (zero reflective vest glare)"
-                className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
-                  hwStatus.light?.mode === 'ir'
-                    ? 'bg-indigo-600 text-white border-indigo-300'
-                    : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border-zinc-800'
-                }`}
-              >
-                <Moon className="w-3 h-3" />
-                IR ONLY (NO FLOOD)
-              </button>
-              <button
-                disabled={lightBusy}
-                onClick={() => applyLightConfig('smart', 30, false)}
-                title="IR until person detected, then gentle 30% white floodlight so vests & plates don't blow out"
-                className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
-                  hwStatus.light?.mode === 'smart' && !hwStatus.light?.auto_brightness
-                    ? 'bg-amber-600 text-white border-amber-300'
-                    : 'bg-zinc-900 hover:bg-zinc-800 text-amber-300 border-zinc-800'
-                }`}
-              >
-                <Lightbulb className="w-3 h-3" />
-                SMART · 30%
-              </button>
-              <button
-                disabled={lightBusy}
-                onClick={() => applyLightConfig('color', draftWhiteBr, false)}
-                title="Keep white color floodlight on continuously at night"
-                className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
-                  hwStatus.light?.mode === 'color'
-                    ? 'bg-amber-500 text-zinc-950 border-amber-200'
-                    : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border-zinc-800'
-                }`}
-              >
-                <Sun className="w-3 h-3" />
-                ALWAYS COLOR
-              </button>
-              <button
-                disabled={lightBusy}
-                onClick={() => applyLightConfig('off')}
-                title="Turn off both IR and white LEDs (use street/porch light only)"
-                className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
-                  hwStatus.light?.mode === 'off'
-                    ? 'bg-zinc-700 text-white border-zinc-400'
-                    : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-400 border-zinc-800'
-                }`}
-              >
-                ALL LIGHTS OFF
-              </button>
-            </div>
-          </div>
-
-          {hwStatus.light?.mode !== 'ir' && hwStatus.light?.mode !== 'off' && (
-            <div className="space-y-1.5 pt-1.5 border-t border-zinc-800">
-              <div className="flex items-center justify-between text-[10px]">
-                <span className="text-zinc-400">FLOODLIGHT LEVEL:</span>
-                <span className="text-amber-300 font-bold">
-                  {draftAutoBr ? 'AUTO (100%)' : `${draftWhiteBr}% MANUAL`}
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <input
-                  type="range"
-                  min={5}
-                  max={100}
-                  step={5}
-                  value={draftWhiteBr}
-                  onChange={(e) => {
-                    setDraftAutoBr(false);
-                    setDraftWhiteBr(Number(e.target.value));
-                  }}
-                  className="flex-1 accent-amber-400 cursor-pointer"
-                />
-                <button
-                  disabled={lightBusy}
-                  onClick={() => applyLightConfig(hwStatus.light?.mode || 'smart', draftWhiteBr, false)}
-                  className="bg-amber-600 hover:bg-amber-500 text-white px-2 py-1 rounded text-[10px] font-bold cursor-pointer"
-                >
-                  SET
+              <div className="flex items-center justify-between border-b border-zinc-800 pb-1.5">
+                <span className="font-bold text-emerald-400">{title} // SCHEDULE</span>
+                <button onClick={() => setShowSchedModal(false)} className="text-zinc-400 hover:text-white cursor-pointer">
+                  <X className="w-4 h-4" />
                 </button>
               </div>
-            </div>
-          )}
 
-          <div className="space-y-2 pt-2 border-t border-zinc-800">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] text-zinc-400 font-bold">CAMERA RTSP MIC STREAM:</span>
-              <button
-                disabled={lightBusy}
-                onClick={() => {
-                  const next = !draftMicEnabled;
-                  setDraftMicEnabled(next);
-                  saveCameraAudioHw(next);
-                }}
-                className={`px-2 py-0.5 rounded text-[10px] font-bold border cursor-pointer ${
-                  draftMicEnabled
-                    ? 'bg-emerald-600 text-white border-emerald-400'
-                    : 'bg-zinc-900 text-zinc-400 border-zinc-700'
-                }`}
-              >
-                {draftMicEnabled ? 'ENABLED' : 'DISABLED'}
-              </button>
-            </div>
-            <div className="flex items-center justify-between gap-2 text-[10px]">
-              <span className="text-zinc-400 w-16">MIC {draftMicVol}%</span>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                step={5}
-                value={draftMicVol}
-                onChange={(e) => setDraftMicVol(Number(e.target.value))}
-                className="flex-1 accent-emerald-400 cursor-pointer"
-              />
-            </div>
-            <div className="flex items-center justify-between gap-2 text-[10px]">
-              <span className="text-zinc-400 w-16">SPK {draftSpkVol}%</span>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                step={5}
-                value={draftSpkVol}
-                onChange={(e) => setDraftSpkVol(Number(e.target.value))}
-                className="flex-1 accent-cyan-400 cursor-pointer"
-              />
-              <button
-                disabled={lightBusy}
-                onClick={() => saveCameraAudioHw()}
-                className="bg-zinc-800 hover:bg-zinc-700 border border-zinc-600 text-zinc-200 px-2 py-0.5 rounded text-[10px] font-bold cursor-pointer"
-              >
-                SAVE
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showTalkModal && hwStatus?.supports_two_way_speaker && (
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="absolute top-11 right-2 z-30 bg-zinc-950/95 border border-cyan-500/50 rounded-lg p-3 w-76 shadow-2xl font-mono text-xs space-y-2.5"
-        >
-          <div className="flex items-center justify-between border-b border-zinc-800 pb-1.5">
-            <span className="font-bold text-cyan-300">{title} // 2-WAY SPEAKER</span>
-            <div className="flex items-center gap-2">
-              {hwStatus.vendor === 'tapo_rtsp' && hwStatus.tapo_auth_configured && (
+              <div className="grid grid-cols-3 gap-1">
                 <button
-                  onClick={() => setShowTapoRelink((prev) => !prev)}
-                  title="Update TP-Link / Tapo Cloud password hash"
-                  className="text-[10px] text-zinc-400 hover:text-cyan-300 cursor-pointer"
-                >
-                  RE-LINK
-                </button>
-              )}
-              <button onClick={() => setShowTalkModal(false)} className="text-zinc-400 hover:text-white cursor-pointer">
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
-
-          {hwStatus.vendor === 'tapo_rtsp' && (!hwStatus.tapo_auth_configured || showTapoRelink) ? (
-            <div className="space-y-2 bg-zinc-900/90 border border-amber-500/40 rounded p-2.5">
-              <div className="text-[10px] text-amber-200 leading-snug">
-                <span className="font-bold">1-Time Tapo Speaker Link:</span> Enter your TP-Link / Tapo app password (verified live & stored only as a SHA-256 hash; unlocks both Loft & Living Room).
-              </div>
-              <div className="flex items-center gap-1.5">
-                <input
-                  type="password"
-                  value={tapoPassInput}
-                  onChange={(e) => setTapoPassInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') linkTapoSpeakers();
-                  }}
-                  placeholder="TP-Link / Tapo app password..."
-                  className="flex-1 bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-100 placeholder:text-zinc-500"
-                />
-                <button
-                  disabled={talkBusy || !tapoPassInput.trim()}
-                  onClick={linkTapoSpeakers}
-                  className="bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white px-2.5 py-1 rounded text-[10px] font-bold cursor-pointer"
-                >
-                  LINK
-                </button>
-              </div>
-            </div>
-          ) : (
-            <>
-              {canBrowserMic ? (
-                <button
-                  disabled={talkBusy && !isRecordingPtt}
-                  onMouseDown={startPushToTalk}
-                  onMouseUp={stopPushToTalk}
-                  onMouseLeave={stopPushToTalk}
-                  onTouchStart={(e) => {
-                    e.preventDefault();
-                    startPushToTalk();
-                  }}
-                  onTouchEnd={(e) => {
-                    e.preventDefault();
-                    stopPushToTalk();
-                  }}
-                  className={`w-full py-2 rounded font-bold text-[11px] border flex items-center justify-center gap-1.5 cursor-pointer select-none transition-colors ${
-                    isRecordingPtt
-                      ? 'bg-red-600 text-white border-red-300 animate-pulse'
-                      : 'bg-cyan-950/90 hover:bg-cyan-900 text-cyan-200 border-cyan-500/60'
+                  onClick={() => saveSchedule('always_record')}
+                  className={`py-1.5 rounded text-[10px] font-bold border cursor-pointer ${
+                    schedMode === 'always_record'
+                      ? 'bg-emerald-600 text-white border-emerald-400'
+                      : 'bg-zinc-900 text-zinc-300 border-zinc-800'
                   }`}
                 >
-                  <Mic className="w-3.5 h-3.5" />
-                  {isRecordingPtt ? 'RELEASE TO BROADCAST' : 'HOLD TO TALK (LIVE MIC)'}
+                  24/7 REC
                 </button>
-              ) : (
-                <div className="text-[10px] text-zinc-400 bg-zinc-900/90 border border-zinc-800 rounded px-2 py-1.5 leading-snug">
-                  Browser live mic requires HTTPS/localhost — quick presets & custom voice below work over HTTP!
-                </div>
-              )}
-
-              {hwStatus.vendor === 'tapo_rtsp' ? (
-                <div className="grid grid-cols-2 gap-1.5">
-                  <button
-                    disabled={talkBusy}
-                    onClick={() => sendSpeakerMessage('dinner_ready')}
-                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-amber-300 font-bold cursor-pointer text-left"
-                  >
-                    🍽️ Dinner's Ready
-                  </button>
-                  <button
-                    disabled={talkBusy}
-                    onClick={() => sendSpeakerMessage('check_in')}
-                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-emerald-300 font-bold cursor-pointer text-left"
-                  >
-                    👋 Check In
-                  </button>
-                  <button
-                    disabled={talkBusy}
-                    onClick={() => sendSpeakerMessage('coming_out')}
-                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-zinc-300 font-bold cursor-pointer text-left"
-                  >
-                    🏃 One Moment
-                  </button>
-                  <button
-                    disabled={talkBusy}
-                    onClick={() => triggerSpeakerChime('polite', false)}
-                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-sky-300 font-bold cursor-pointer text-left"
-                  >
-                    🔔 Polite Chime
-                  </button>
-                </div>
-              ) : (
-                <div className="grid grid-cols-2 gap-1.5">
-                  <button
-                    disabled={talkBusy}
-                    onClick={() => sendSpeakerMessage('leave_door')}
-                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-amber-300 font-bold cursor-pointer text-left"
-                  >
-                    📦 Leave at Door
-                  </button>
-                  <button
-                    disabled={talkBusy}
-                    onClick={() => sendSpeakerMessage('coming_out')}
-                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-emerald-300 font-bold cursor-pointer text-left"
-                  >
-                    👋 Coming Out
-                  </button>
-                  <button
-                    disabled={talkBusy}
-                    onClick={() => sendSpeakerMessage('no_soliciting')}
-                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-zinc-300 font-bold cursor-pointer text-left"
-                  >
-                    🚫 No Soliciting
-                  </button>
-                  <button
-                    disabled={talkBusy}
-                    onClick={() => triggerSpeakerChime('polite', false)}
-                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-sky-300 font-bold cursor-pointer text-left"
-                  >
-                    🔔 Polite Chime
-                  </button>
-                </div>
-              )}
-
-              <button
-                disabled={talkBusy}
-                onClick={() => triggerSpeakerChime('warning', true)}
-                className="w-full bg-red-950/90 hover:bg-red-900 border border-red-500/60 py-1.5 px-2 rounded text-[10px] text-red-200 font-bold flex items-center justify-center gap-1.5 cursor-pointer"
-              >
-                <Siren className="w-3.5 h-3.5 text-red-400" />
-                SIREN CHIME + RECORDING WARNING
-              </button>
-
-              <div className="flex items-center gap-1.5 pt-1 border-t border-zinc-800">
-                <input
-                  type="text"
-                  value={ttsText}
-                  onChange={(e) => setTtsText(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') sendSpeakerMessage(ttsText);
-                  }}
-                  placeholder="Type custom message to speak..."
-                  className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-100 placeholder:text-zinc-500"
-                />
                 <button
-                  disabled={talkBusy || !ttsText.trim()}
-                  onClick={() => sendSpeakerMessage(ttsText)}
-                  className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white px-2.5 py-1 rounded text-[10px] font-bold flex items-center gap-1 cursor-pointer"
+                  onClick={() => saveSchedule('paused')}
+                  className={`py-1.5 rounded text-[10px] font-bold border cursor-pointer ${
+                    schedMode === 'paused'
+                      ? 'bg-amber-600 text-white border-amber-400'
+                      : 'bg-zinc-900 text-zinc-300 border-zinc-800'
+                  }`}
                 >
-                  <Send className="w-3 h-3" />
-                  SAY
+                  PAUSE NOW
+                </button>
+                <button
+                  onClick={() => setSchedMode('schedule')}
+                  className={`py-1.5 rounded text-[10px] font-bold border cursor-pointer ${
+                    schedMode === 'schedule'
+                      ? 'bg-sky-600 text-white border-sky-400'
+                      : 'bg-zinc-900 text-zinc-300 border-zinc-800'
+                  }`}
+                >
+                  SCHEDULE
                 </button>
               </div>
-            </>
-          )}
 
-          {talkStatusMsg && (
-            <div className="text-[10px] text-cyan-300 break-words leading-snug pt-0.5">{talkStatusMsg}</div>
-          )}
-        </div>
-      )}
+              {schedMode === 'schedule' && (
+                <div className="space-y-2 pt-1 border-t border-zinc-800">
+                  <div className="text-[10px] text-zinc-400">Active Recording Window (PT):</div>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-[10px] text-zinc-400">START:</label>
+                    <input
+                      type="time"
+                      value={schedStart}
+                      onChange={(e) => setSchedStart(e.target.value)}
+                      className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-100"
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-[10px] text-zinc-400">STOP:</label>
+                    <input
+                      type="time"
+                      value={schedEnd}
+                      onChange={(e) => setSchedEnd(e.target.value)}
+                      className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-100"
+                    />
+                  </div>
+                  <button
+                    onClick={() => saveSchedule('schedule')}
+                    className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-1.5 rounded text-[11px] cursor-pointer"
+                  >
+                    SAVE WINDOW
+                  </button>
+                </div>
+              )}
+
+              <div className="pt-2 border-t border-zinc-800 space-y-1.5">
+                <div className="text-[10px] font-bold text-zinc-300">CAMERA PUSH POSTURE (HOME):</div>
+                <div className="grid grid-cols-3 gap-1">
+                  <button
+                    onClick={() => {
+                      setSilentLogging(false);
+                      setAlertWhitelist(false);
+                      saveSchedule(schedMode, false, false);
+                    }}
+                    className={`py-1 rounded text-[9px] font-bold border cursor-pointer ${
+                      !silentLogging && !alertWhitelist
+                        ? 'bg-emerald-600 text-white border-emerald-400'
+                        : 'bg-zinc-900 text-zinc-400 border-zinc-800'
+                    }`}
+                  >
+                    FAM·SILENT
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSilentLogging(true);
+                      setAlertWhitelist(false);
+                      saveSchedule(schedMode, false, true);
+                    }}
+                    title="Record & log clips/Face ID silently to Kill-Feed with zero push alarms while HOME"
+                    className={`py-1 rounded text-[9px] font-bold border cursor-pointer ${
+                      silentLogging
+                        ? 'bg-violet-600 text-white border-violet-300'
+                        : 'bg-zinc-900 text-zinc-400 border-zinc-800'
+                    }`}
+                  >
+                    LOG·ONLY
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSilentLogging(false);
+                      setAlertWhitelist(true);
+                      saveSchedule(schedMode, true, false);
+                    }}
+                    className={`py-1 rounded text-[9px] font-bold border cursor-pointer ${
+                      !silentLogging && alertWhitelist
+                        ? 'bg-sky-600 text-white border-sky-400'
+                        : 'bg-zinc-900 text-zinc-400 border-zinc-800'
+                    }`}
+                  >
+                    FAM·ALERT
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
+      {showLightModal &&
+        hwStatus?.supports_light &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            onClick={() => setShowLightModal(false)}
+            className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/55 backdrop-blur-[2px]"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="bg-zinc-950/95 border border-amber-500/50 rounded-lg p-3.5 w-full max-w-xs max-h-[90vh] overflow-y-auto shadow-2xl font-mono text-xs space-y-2.5"
+            >
+              <div className="flex items-center justify-between border-b border-zinc-800 pb-1.5">
+                <span className="font-bold text-amber-300">{title} // OPTICS & AUDIO</span>
+                <button onClick={() => setShowLightModal(false)} className="text-zinc-400 hover:text-white cursor-pointer">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="text-[10px] text-zinc-400 font-bold">NIGHT SUPPLEMENT LIGHT MODE:</div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    disabled={lightBusy}
+                    onClick={() => applyLightConfig('ir')}
+                    title="Invisible IR LEDs only — White floodlight NEVER turns on (zero reflective vest glare)"
+                    className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
+                      hwStatus.light?.mode === 'ir'
+                        ? 'bg-indigo-600 text-white border-indigo-300'
+                        : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border-zinc-800'
+                    }`}
+                  >
+                    <Moon className="w-3 h-3" />
+                    IR ONLY (NO FLOOD)
+                  </button>
+                  <button
+                    disabled={lightBusy}
+                    onClick={() => applyLightConfig('smart', 30, false)}
+                    title="IR until person detected, then gentle 30% white floodlight so vests & plates don't blow out"
+                    className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
+                      hwStatus.light?.mode === 'smart' && !hwStatus.light?.auto_brightness
+                        ? 'bg-amber-600 text-white border-amber-300'
+                        : 'bg-zinc-900 hover:bg-zinc-800 text-amber-300 border-zinc-800'
+                    }`}
+                  >
+                    <Lightbulb className="w-3 h-3" />
+                    SMART · 30%
+                  </button>
+                  <button
+                    disabled={lightBusy}
+                    onClick={() => applyLightConfig('color', draftWhiteBr, false)}
+                    title="Keep white color floodlight on continuously at night"
+                    className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
+                      hwStatus.light?.mode === 'color'
+                        ? 'bg-amber-500 text-zinc-950 border-amber-200'
+                        : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border-zinc-800'
+                    }`}
+                  >
+                    <Sun className="w-3 h-3" />
+                    ALWAYS COLOR
+                  </button>
+                  <button
+                    disabled={lightBusy}
+                    onClick={() => applyLightConfig('off')}
+                    title="Turn off both IR and white LEDs (use street/porch light only)"
+                    className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
+                      hwStatus.light?.mode === 'off'
+                        ? 'bg-zinc-700 text-white border-zinc-400'
+                        : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-400 border-zinc-800'
+                    }`}
+                  >
+                    ALL LIGHTS OFF
+                  </button>
+                </div>
+              </div>
+
+              {hwStatus.light?.mode !== 'ir' && hwStatus.light?.mode !== 'off' && (
+                <div className="space-y-1.5 pt-1.5 border-t border-zinc-800">
+                  <div className="flex items-center justify-between text-[10px]">
+                    <span className="text-zinc-400">FLOODLIGHT LEVEL:</span>
+                    <span className="text-amber-300 font-bold">
+                      {draftAutoBr ? 'AUTO (100%)' : `${draftWhiteBr}% MANUAL`}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={5}
+                      max={100}
+                      step={5}
+                      value={draftWhiteBr}
+                      onChange={(e) => {
+                        setDraftAutoBr(false);
+                        setDraftWhiteBr(Number(e.target.value));
+                      }}
+                      className="flex-1 accent-amber-400 cursor-pointer"
+                    />
+                    <button
+                      disabled={lightBusy}
+                      onClick={() => applyLightConfig(hwStatus.light?.mode || 'smart', draftWhiteBr, false)}
+                      className="bg-amber-600 hover:bg-amber-500 text-white px-2 py-1 rounded text-[10px] font-bold cursor-pointer"
+                    >
+                      SET
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="space-y-2 pt-2 border-t border-zinc-800">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-zinc-400 font-bold">CAMERA RTSP MIC STREAM:</span>
+                  <button
+                    disabled={lightBusy}
+                    onClick={() => {
+                      const next = !draftMicEnabled;
+                      setDraftMicEnabled(next);
+                      saveCameraAudioHw(next);
+                    }}
+                    className={`px-2 py-0.5 rounded text-[10px] font-bold border cursor-pointer ${
+                      draftMicEnabled
+                        ? 'bg-emerald-600 text-white border-emerald-400'
+                        : 'bg-zinc-900 text-zinc-400 border-zinc-700'
+                    }`}
+                  >
+                    {draftMicEnabled ? 'ENABLED' : 'DISABLED'}
+                  </button>
+                </div>
+                <div className="flex items-center justify-between gap-2 text-[10px]">
+                  <span className="text-zinc-400 w-16">MIC {draftMicVol}%</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={5}
+                    value={draftMicVol}
+                    onChange={(e) => setDraftMicVol(Number(e.target.value))}
+                    className="flex-1 accent-emerald-400 cursor-pointer"
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-2 text-[10px]">
+                  <span className="text-zinc-400 w-16">SPK {draftSpkVol}%</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={5}
+                    value={draftSpkVol}
+                    onChange={(e) => setDraftSpkVol(Number(e.target.value))}
+                    className="flex-1 accent-cyan-400 cursor-pointer"
+                  />
+                  <button
+                    disabled={lightBusy}
+                    onClick={() => saveCameraAudioHw()}
+                    className="bg-zinc-800 hover:bg-zinc-700 border border-zinc-600 text-zinc-200 px-2 py-0.5 rounded text-[10px] font-bold cursor-pointer"
+                  >
+                    SAVE
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
+      {showTalkModal &&
+        hwStatus?.supports_two_way_speaker &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            onClick={() => setShowTalkModal(false)}
+            className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/55 backdrop-blur-[2px]"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="bg-zinc-950/95 border border-cyan-500/60 rounded-lg p-3.5 w-full max-w-sm max-h-[90vh] overflow-y-auto shadow-2xl font-mono text-xs space-y-2.5"
+            >
+              <div className="flex items-center justify-between border-b border-zinc-800 pb-1.5">
+                <span className="font-bold text-cyan-300">{title} // 2-WAY SPEAKER</span>
+                <div className="flex items-center gap-2.5">
+                  {hwStatus.vendor === 'tapo_rtsp' && hwStatus.tapo_auth_configured && (
+                    <button
+                      onClick={() => setShowTapoRelink((prev) => !prev)}
+                      title="Update TP-Link / Tapo Cloud password hash"
+                      className="text-[10px] text-zinc-400 hover:text-cyan-300 cursor-pointer"
+                    >
+                      RE-LINK
+                    </button>
+                  )}
+                  <button onClick={() => setShowTalkModal(false)} className="text-zinc-400 hover:text-white cursor-pointer">
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {hwStatus.vendor === 'tapo_rtsp' && (!hwStatus.tapo_auth_configured || showTapoRelink) ? (
+                <div className="space-y-2 bg-zinc-900/90 border border-amber-500/40 rounded p-2.5">
+                  <div className="text-[10px] text-amber-200 leading-snug">
+                    <span className="font-bold">1-Time Tapo Speaker Link:</span> Enter your TP-Link / Tapo app password (verified live & stored only as a SHA-256 hash; unlocks both Loft & Living Room).
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="password"
+                      value={tapoPassInput}
+                      onChange={(e) => setTapoPassInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') linkTapoSpeakers();
+                      }}
+                      placeholder="TP-Link / Tapo app password..."
+                      className="flex-1 bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-100 placeholder:text-zinc-500"
+                    />
+                    <button
+                      disabled={talkBusy || !tapoPassInput.trim()}
+                      onClick={linkTapoSpeakers}
+                      className="bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white px-2.5 py-1 rounded text-[10px] font-bold cursor-pointer"
+                    >
+                      LINK
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {canBrowserMic && (
+                    <button
+                      disabled={talkBusy && !isRecordingPtt}
+                      onMouseDown={startPushToTalk}
+                      onMouseUp={stopPushToTalk}
+                      onMouseLeave={stopPushToTalk}
+                      onTouchStart={(e) => {
+                        e.preventDefault();
+                        startPushToTalk();
+                      }}
+                      onTouchEnd={(e) => {
+                        e.preventDefault();
+                        stopPushToTalk();
+                      }}
+                      className={`w-full py-2 rounded font-bold text-[11px] border flex items-center justify-center gap-1.5 cursor-pointer select-none transition-colors ${
+                        isRecordingPtt
+                          ? 'bg-red-600 text-white border-red-300 animate-pulse'
+                          : 'bg-cyan-950/90 hover:bg-cyan-900 text-cyan-200 border-cyan-500/60'
+                      }`}
+                    >
+                      <Mic className="w-3.5 h-3.5" />
+                      {isRecordingPtt ? 'RELEASE TO BROADCAST' : 'HOLD TO TALK (LIVE MIC)'}
+                    </button>
+                  )}
+
+                  {hwStatus.tts_voices && hwStatus.tts_voices.length > 0 && (
+                    <div className="flex items-center gap-1.5 bg-zinc-900/90 border border-zinc-800 rounded px-2 py-1.5">
+                      <span className="text-[10px] text-zinc-400 font-bold whitespace-nowrap">🎙️ VOICE</span>
+                      <select
+                        value={hwStatus.tts_voice || 'andrew'}
+                        onChange={(e) => changeTtsVoice(e.target.value)}
+                        disabled={talkBusy}
+                        className="flex-1 bg-zinc-950 border border-zinc-700 rounded px-1.5 py-0.5 text-[11px] text-cyan-200 font-bold cursor-pointer focus:outline-none focus:border-cyan-400"
+                      >
+                        {hwStatus.tts_voices.map((v) => (
+                          <option key={v.id} value={v.id}>
+                            {v.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {hwStatus.vendor === 'tapo_rtsp' ? (
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        disabled={talkBusy}
+                        onClick={() => sendSpeakerMessage('dinner_ready')}
+                        className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-2 px-2.5 rounded text-[11px] text-amber-300 font-bold cursor-pointer text-left"
+                      >
+                        🍽️ Yo! Dinner's Ready
+                      </button>
+                      <button
+                        disabled={talkBusy}
+                        onClick={() => sendSpeakerMessage('check_in')}
+                        className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-2 px-2.5 rounded text-[11px] text-emerald-300 font-bold cursor-pointer text-left"
+                      >
+                        👋 Check In
+                      </button>
+                      <button
+                        disabled={talkBusy}
+                        onClick={() => sendSpeakerMessage('coming_out')}
+                        className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-2 px-2.5 rounded text-[11px] text-zinc-300 font-bold cursor-pointer text-left"
+                      >
+                        🏃 One Sec
+                      </button>
+                      <button
+                        disabled={talkBusy}
+                        onClick={() => triggerSpeakerChime('polite', false)}
+                        className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-2 px-2.5 rounded text-[11px] text-sky-300 font-bold cursor-pointer text-left"
+                      >
+                        🔔 Polite Chime
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        disabled={talkBusy}
+                        onClick={() => sendSpeakerMessage('leave_door')}
+                        className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-2 px-2.5 rounded text-[11px] text-amber-300 font-bold cursor-pointer text-left"
+                      >
+                        📦 Leave at Door
+                      </button>
+                      <button
+                        disabled={talkBusy}
+                        onClick={() => sendSpeakerMessage('coming_out')}
+                        className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-2 px-2.5 rounded text-[11px] text-emerald-300 font-bold cursor-pointer text-left"
+                      >
+                        🏃 One Sec
+                      </button>
+                      <button
+                        disabled={talkBusy}
+                        onClick={() => sendSpeakerMessage('no_soliciting')}
+                        className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-2 px-2.5 rounded text-[11px] text-zinc-300 font-bold cursor-pointer text-left"
+                      >
+                        🚫 No Soliciting
+                      </button>
+                      <button
+                        disabled={talkBusy}
+                        onClick={() => triggerSpeakerChime('polite', false)}
+                        className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-2 px-2.5 rounded text-[11px] text-sky-300 font-bold cursor-pointer text-left"
+                      >
+                        🔔 Polite Chime
+                      </button>
+                    </div>
+                  )}
+
+                  <button
+                    disabled={talkBusy}
+                    onClick={() => triggerSpeakerChime('warning', true)}
+                    className="w-full bg-red-950/90 hover:bg-red-900 border border-red-500/60 py-2 px-2 rounded text-[10px] text-red-200 font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Siren className="w-3.5 h-3.5 text-red-400" />
+                    SIREN CHIME + RECORDING WARNING
+                  </button>
+
+                  <div className="flex items-center gap-1.5 pt-1 border-t border-zinc-800">
+                    <input
+                      type="text"
+                      value={ttsText}
+                      onChange={(e) => setTtsText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') sendSpeakerMessage(ttsText);
+                      }}
+                      placeholder="Type custom message to speak..."
+                      className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-500"
+                    />
+                    <button
+                      disabled={talkBusy || !ttsText.trim()}
+                      onClick={() => sendSpeakerMessage(ttsText)}
+                      className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white px-3 py-1.5 rounded text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                    >
+                      <Send className="w-3 h-3" />
+                      SAY
+                    </button>
+                  </div>
+
+                  {!canBrowserMic && (
+                    <div className="text-[9px] text-zinc-500 leading-tight">
+                      Tip: Presets & custom TTS work over HTTP; live Push-to-Talk mic requires HTTPS/localhost.
+                    </div>
+                  )}
+                </>
+              )}
+
+              {talkStatusMsg && (
+                <div className="text-[10px] text-cyan-300 break-words leading-snug pt-0.5">{talkStatusMsg}</div>
+              )}
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   );
 }
