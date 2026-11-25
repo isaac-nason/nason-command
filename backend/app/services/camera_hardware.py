@@ -725,61 +725,147 @@ class CameraHardwareService:
                 except Exception:
                     pass
 
+    async def _verify_tapo_8800_digest(self, host: str, candidates: list[tuple[str, str]]) -> tuple[str, str] | None:
+        """
+        Tests Digest credentials directly against Tapo's port 8800 Streamd endpoint
+        (the exact HTTP Digest socket go2rtc uses for 2-way talk) instead of port 443's
+        firmware-dependent KLAP/v4 challenge.
+        """
+        for uname, secret in candidates:
+            if not uname or not secret:
+                continue
+            try:
+                r1, w1 = await asyncio.wait_for(asyncio.open_connection(host, 8800), timeout=3.0)
+                req1 = (
+                    f"POST /stream HTTP/1.1\r\n"
+                    f"Host: {host}:8800\r\n"
+                    "Content-Type: multipart/mixed; boundary=--client-stream-boundary--\r\n"
+                    "Content-Length: 0\r\n\r\n"
+                )
+                w1.write(req1.encode("utf-8"))
+                await w1.drain()
+                resp1 = (await asyncio.wait_for(r1.read(2048), timeout=3.0)).decode(errors="ignore")
+                w1.close()
+                try:
+                    await w1.wait_closed()
+                except Exception:
+                    pass
+
+                m_auth = re.search(r"WWW-Authenticate:\s*Digest\s+([^\r\n]+)", resp1, re.IGNORECASE)
+                if not m_auth:
+                    continue
+                chall = m_auth.group(1)
+                m_realm = re.search(r'realm="([^"]+)"', chall)
+                m_nonce = re.search(r'nonce="([^"]+)"', chall)
+                m_qop = re.search(r'qop="([^"]+)"', chall)
+                m_opaque = re.search(r'opaque="([^"]+)"', chall)
+                if not (m_realm and m_nonce):
+                    continue
+
+                realm = m_realm.group(1)
+                nonce = m_nonce.group(1)
+                qop = m_qop.group(1) if m_qop else "auth"
+                opaque = m_opaque.group(1) if m_opaque else ""
+                uri = "/stream"
+                nc = "00000001"
+                cnonce = os.urandom(16).hex()
+
+                ha1 = hashlib.md5(f"{uname}:{realm}:{secret}".encode("utf-8")).hexdigest()
+                ha2 = hashlib.md5(f"POST:{uri}".encode("utf-8")).hexdigest()
+                resp_dig = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode("utf-8")).hexdigest()
+
+                auth_hdr = (
+                    f'Digest username="{uname}", realm="{realm}", nonce="{nonce}", '
+                    f'uri="{uri}", qop={qop}, nc={nc}, cnonce="{cnonce}", response="{resp_dig}"'
+                )
+                if opaque:
+                    auth_hdr += f', opaque="{opaque}", algorithm=MD5'
+
+                r2, w2 = await asyncio.wait_for(asyncio.open_connection(host, 8800), timeout=3.0)
+                req2 = (
+                    f"POST {uri} HTTP/1.1\r\n"
+                    f"Host: {host}:8800\r\n"
+                    f"Authorization: {auth_hdr}\r\n"
+                    "Content-Type: multipart/mixed; boundary=--client-stream-boundary--\r\n\r\n"
+                )
+                w2.write(req2.encode("utf-8"))
+                await w2.drain()
+                line2 = (await asyncio.wait_for(r2.readline(), timeout=3.0)).decode(errors="ignore")
+                w2.close()
+                try:
+                    await w2.wait_closed()
+                except Exception:
+                    pass
+
+                if " 200 " in line2:
+                    return (uname, secret)
+            except Exception:
+                continue
+        return None
+
     async def set_tapo_cloud_password(self, cloud_password: str) -> dict:
         """
-        Verifies the user's TP-Link/Tapo Cloud password cryptographically against a live LAN Tapo
-        camera's SHA-256 device_confirm challenge, then stores ONLY irreversible SHA-256 & MD5
-        hashes on disk (zero plaintext password stored).
+        Verifies the user's TP-Link/Tapo Cloud password directly against Tapo's port 8800
+        Streamd HTTP Digest server (the exact socket go2rtc uses), then stores ONLY the
+        verified irreversible hash on disk (zero plaintext password stored).
         """
         pw = (cloud_password or "").strip()
         if not pw:
             raise ValueError("Tapo Cloud password cannot be empty")
 
         sha_up = hashlib.sha256(pw.encode("utf-8")).hexdigest().upper()
+        sha_low = sha_up.lower()
         md5_up = hashlib.md5(pw.encode("utf-8")).hexdigest().upper()
+        md5_low = md5_up.lower()
 
         cams = _parse_mediamtx_cameras()
-        tapo_hosts = [c["host"] for c in cams.values() if c.get("vendor") == "tapo_rtsp"]
+        tapo_cams = [c for c in cams.values() if c.get("vendor") == "tapo_rtsp"]
         verified_host = None
+        matched_user = "admin"
+        matched_secret = sha_up
+        reachable_any = False
 
-        for host in tapo_hosts:
+        for c in tapo_cams:
+            host = c["host"]
+            rtsp_u = c.get("username") or ""
+            cands: list[tuple[str, str]] = [
+                ("admin", sha_up),
+                ("admin", md5_up),
+                ("admin", sha_low),
+                ("admin", md5_low),
+            ]
+            if rtsp_u and rtsp_u != "admin":
+                cands.extend([(rtsp_u, sha_up), (rtsp_u, md5_up)])
+            # Also support if user pasted an already-computed 64-char SHA256 or 32-char MD5 hex hash
+            if re.fullmatch(r"[0-9a-fA-F]{64}", pw) or re.fullmatch(r"[0-9a-fA-F]{32}", pw):
+                cands.insert(0, ("admin", pw.upper()))
+
             try:
-                cnonce = os.urandom(8).hex().upper()
-                async with httpx.AsyncClient(verify=False, timeout=4.5) as client:
-                    resp = await client.post(
-                        f"https://{host}/",
-                        json={
-                            "method": "do",
-                            "login": {
-                                "username": "admin",
-                                "cnonce": cnonce,
-                                "encrypt_type": "3",
-                            },
-                        },
-                    )
-                    if resp.status_code == 200:
-                        data = (resp.json() or {}).get("data") or {}
-                        snonce = str(data.get("nonce") or "").strip().upper()
-                        dev_conf = str(data.get("device_confirm") or "").strip().upper()
-                        if snonce and len(dev_conf) >= 64:
-                            cands = {
-                                hashlib.sha256(f"{cnonce}{sha_up}{snonce}".encode()).hexdigest().upper(),
-                                hashlib.sha256(f"{sha_up}{cnonce}{snonce}".encode()).hexdigest().upper(),
-                                hashlib.sha256(f"{cnonce}{md5_up}{snonce}".encode()).hexdigest().upper(),
-                            }
-                            if dev_conf[:64] not in cands:
-                                raise ValueError(
-                                    "Incorrect TP-Link / Tapo app password (rejected by camera cryptographic challenge)"
-                                )
-                            verified_host = host
-                            break
-            except ValueError:
-                raise
+                r_chk, w_chk = await asyncio.wait_for(asyncio.open_connection(host, 8800), timeout=2.5)
+                w_chk.close()
+                try:
+                    await w_chk.wait_closed()
+                except Exception:
+                    pass
+                reachable_any = True
             except Exception:
                 continue
 
+            matched = await self._verify_tapo_8800_digest(host, cands)
+            if matched:
+                matched_user, matched_secret = matched
+                verified_host = host
+                break
+
+        if reachable_any and not verified_host:
+            raise ValueError(
+                "Rejected by Tapo port 8800 — make sure you enter your main TP-Link / Tapo mobile app login password (not the RTSP camera password)"
+            )
+
         async with self._config_lock:
             self._saved_state["_tapo_auth"] = {
+                "cred_user": matched_user,
+                "cred_secret": matched_secret,
                 "sha256": sha_up,
                 "md5": md5_up,
                 "verified_host": verified_host,
@@ -878,7 +964,12 @@ class CameraHardwareService:
 
         stream_key = f"{camera_id}_talk"
         duration_s = len(padded_ulaw) / 8000.0
-        auth_candidates = [f"admin:{sha_up}"] + ([f"admin:{md5_up}"] if md5_up else [])
+        primary_u = tapo_auth.get("cred_user") or "admin"
+        primary_s = tapo_auth.get("cred_secret") or sha_up
+        auth_candidates: list[str] = [f"{primary_u}:{primary_s}"]
+        for extra in (f"admin:{sha_up}", f"admin:{md5_up}" if md5_up else ""):
+            if extra and extra not in auth_candidates:
+                auth_candidates.append(extra)
 
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
