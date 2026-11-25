@@ -11,7 +11,7 @@ DEFAULT_RULES = [
         "name": "AMAZON",
         "kind": "carrier",
         "alert_mode": "alert",
-        "cues": "Amazon smile arrow logo, two-tone sky-blue/cyan and dark-navy Amazon vest with horizontal silver/grey reflective stripes (even when chest/back logo is covered by hoodie or package), branded Amazon polo/jacket, brown cardboard shipping parcel or brown kraft/white padded mailer with barcode + handheld phone/scanner, or commercial cargo/Amazon van stopped at curb (NEVER wheeled blue curbside recycling or trash bins)",
+        "cues": "Amazon smile arrow logo, two-tone sky-blue/cyan and dark-navy Amazon vest with horizontal silver/grey reflective stripes (which glow/bloom bright white at night under camera floodlight/IR), branded Amazon polo/jacket, brown cardboard shipping parcel or brown kraft/white padded mailer + handheld phone/scanner, or dark-grey/white commercial cargo/Sprinter delivery van (often with sliding door open) stopped at curb (NEVER wheeled blue curbside recycling or trash bins)",
         "sightings": 0,
         "last_seen": None,
     },

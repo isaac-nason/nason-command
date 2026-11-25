@@ -143,20 +143,26 @@ def _is_valid_food_delivery(summary: str, in_tripwire: bool, recent_household_ca
     return any(p in low for p in positive_terms)
 
 
-def _infer_carrier_from_summary(summary: str, active_rule_names: list[str]) -> str:
+def _infer_carrier_from_summary(summary: str, active_rule_names: list[str], in_tripwire: bool = False) -> str:
     """
     Deterministic safety net when Qwen2.5-VL explicitly describes a branded carrier vest/uniform/tool
-    in 'summary' (e.g. 'Person wearing Amazon delivery vest walking away') while leaving carrier='NONE'.
+    in 'summary' (e.g. 'Person wearing Amazon delivery vest' or night floodlight 'wearing bright reflective
+    clothing, carrying items') while leaving carrier='NONE'.
     """
     low = (summary or "").lower()
-    if not low or any(neg in low for neg in ("not amazon", "no amazon", "recycling bin", "trash bin", "yard-waste")):
+    if not low or any(neg in low for neg in ("not amazon", "no amazon", "recycling bin", "trash bin", "yard-waste", "sidewalk", "leash")):
         return "NONE"
     active = {r.upper() for r in (active_rule_names or [])}
     if "AMAZON" in active and (
         "amazon" in low
         or (
             any(v in low for v in ("delivery vest", "reflective vest", "blue vest"))
-            and any(p in low for p in ("package", "parcel", "mailer", "box", "delivery"))
+            and any(p in low for p in ("package", "parcel", "mailer", "box", "delivery", "carrying"))
+        )
+        or (
+            in_tripwire
+            and any(v in low for v in ("reflective clothing", "reflective jacket", "bright reflective"))
+            and any(p in low for p in ("package", "parcel", "mailer", "box", "delivery", "carrying item", "carrying bag", "carrying box"))
         )
     ):
         return "AMAZON"
@@ -733,7 +739,7 @@ async def deep_inspect_detection(event_id: int) -> dict:
                         "If a person is walking an animal on a sidewalk/leash, classify sub_type as 'dog' and mention the owner/leash in summary. "
                         "If a small four-legged animal is alone on the driveway/pavement with NO person or leash visible, classify sub_type as 'cat'. "
                         "Populate 'plate' ONLY when 'category' is 'vehicle' (an actively moving/arriving/departing vehicle with a legible plate; omit the central Oregon tree icon between digits and letters). For all person, delivery, or animal detections, ALWAYS set 'plate' to 'NONE' (NEVER read license plates off parked background cars). "
-                        f"Set 'carrier' to one of {active_rule_names} when clear delivery/service evidence is visible across Image 1 (subject crop) and Image 2 (wide driveway/street context): LANDSCAPERS (mowers/blowers/trimmers/crew vests), AMAZON (Amazon smile arrow logo OR two-tone sky-blue/cyan and dark-navy reflective delivery vest with horizontal silver/grey stripes — even when the chest/back smile logo is covered by a hoodie or held package — especially when carrying a brown cardboard parcel or brown kraft/white padded shipping mailer + handheld phone/scanner, or walking from a commercial cargo/Amazon van stopped at the curb in Image 2), UPS/FEDEX/USPS (branded carrier vest/uniform, delivery van/truck at curb, or shipping parcel + scanner), or FOOD_DELIVERY (ONLY when a courier approaches from the street holding an insulated rectangular red/black thermal pizza/food bag or flat horizontal cardboard pizza boxes — NEVER set FOOD_DELIVERY for empty-handed walkers, children, restaurant logo T-shirts, drinks/cans, laundry baskets, or people interacting with parked driveway cars); otherwise set 'carrier' to 'NONE'. "
+                        f"Set 'carrier' to one of {active_rule_names} when clear delivery/service evidence is visible across Image 1 (subject crop) and Image 2 (wide driveway/street context): LANDSCAPERS (mowers/blowers/trimmers/crew vests), AMAZON (Amazon smile arrow logo OR two-tone sky-blue/cyan and dark-navy reflective delivery vest with horizontal silver/grey stripes — NOTE: at night under camera floodlight/IR, the vest's retroreflective bands glow/bloom intensely bright white over light-blue vest fabric — especially when carrying brown/white parcels or mailers, or stepping out of a dark-grey/blue/white commercial cargo/Sprinter delivery van with open sliding door stopped at the curb in Image 2), UPS/FEDEX/USPS (branded carrier vest/uniform, delivery van/truck at curb, or shipping parcel + scanner), or FOOD_DELIVERY (ONLY when a courier approaches from the street holding an insulated rectangular red/black thermal pizza/food bag or flat horizontal cardboard pizza boxes — NEVER set FOOD_DELIVERY for empty-handed walkers, children, restaurant logo T-shirts, drinks/cans, laundry baskets, or people interacting with parked driveway cars); otherwise set 'carrier' to 'NONE'. "
                         "CRITICAL GUARDRAIL: Residents rolling wheeled curbside trash, recycling, or yard-waste bins (blue, black, green, or gray plastic carts with lids/wheels) or carrying open plastic laundry baskets are household activity ('category': 'person', 'carrier': 'NONE'). "
                         "Set 'school_commuter' to true ONLY if the subject is a student/youth wearing a school backpack who is casually walking along the public sidewalk or exiting away toward the street with NO package delivery and NO tampering with vehicles/house. "
                         "Set 'face_visible' to true ONLY if a person's actual facial features (eyes/nose) are clearly visible in Image 1 (the close-up crop); set 'face_visible' to false if walking away, only the back of their head/hoodie/backpack is visible, blurry night silhouette, or head cropped out. "
@@ -890,7 +896,7 @@ async def deep_inspect_detection(event_id: int) -> dict:
                                         await session.commit()
                                         return {"id": ev.id, "purged": True, "ai_notes": "Purged routine school-commute backpack walker"}
                             if carrier == "NONE" and face_role != "whitelist":
-                                carrier = _infer_carrier_from_summary(summary, active_rule_names)
+                                carrier = _infer_carrier_from_summary(summary, active_rule_names, in_tripwire=in_tripwire)
                             if carrier == "FOOD_DELIVERY" and not _is_valid_food_delivery(
                                 summary, in_tripwire, recent_household_car_arrival
                             ):

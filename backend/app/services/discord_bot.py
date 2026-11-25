@@ -20,6 +20,7 @@ from app.services.cv_pipeline import (
 )
 from app.agent.orchestrator import probe_workstation_ollama, pick_best_vlm
 from app.services.perimeter_security import perimeter_service
+from app.services.camera_hardware import camera_hardware_service
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
@@ -65,6 +66,65 @@ COMMAND_REGISTRY: list[dict] = [
         "slash_def": {
             "name": "sitrep",
             "description": "Post a full 3-camera visual Sitrep card",
+        },
+    },
+    {
+        "name": "light",
+        "aliases": ["floodlight"],
+        "section": "📸 Live Optics & Visuals",
+        "slash_usage": "/light mode:[ir | smart_30 | smart | color | off]",
+        "text_usage": "!light [ir | smart 30 | color | off | status]",
+        "summary": "Control Driveway camera lighting (`ir` = Floodlight OFF / IR night vision; `smart_30` = anti-glare 30% floodlight).",
+        "slash_def": {
+            "name": "light",
+            "description": "Control Driveway camera night vision / white floodlight mode and brightness",
+            "options": [
+                {
+                    "name": "mode",
+                    "description": "Lighting mode for Driveway camera (annke_1)",
+                    "type": 3,
+                    "required": True,
+                    "choices": [
+                        {"name": "🌙 IR Only — Turn White Floodlight OFF (No Glare)", "value": "ir"},
+                        {"name": "🎯 Smart Floodlight @ 30% Anti-Glare", "value": "smart 30"},
+                        {"name": "⚡ Smart Floodlight @ Auto Brightness", "value": "smart auto"},
+                        {"name": "☀️ Always-On Color Floodlight @ 35%", "value": "color 35"},
+                        {"name": "🌑 All Camera Lights OFF", "value": "off"},
+                        {"name": "📊 Check Current Light Status", "value": "status"},
+                    ],
+                }
+            ],
+        },
+    },
+    {
+        "name": "say",
+        "aliases": ["speak"],
+        "section": "📸 Live Optics & Visuals",
+        "slash_usage": "/say message:<text | chime> [camera]",
+        "text_usage": "!say [driveway | loft | living] <message | chime>",
+        "summary": "Speak a voice message or chime out the Driveway, Loft, or Living Room camera speaker.",
+        "slash_def": {
+            "name": "say",
+            "description": "Speak a message or play a chime out any camera speaker (Driveway, Loft, Living Room)",
+            "options": [
+                {
+                    "name": "message",
+                    "description": "Text to speak (or 'leave_door', 'dinner_ready', 'warning', 'chime')",
+                    "type": 3,
+                    "required": True,
+                },
+                {
+                    "name": "camera",
+                    "description": "Target camera speaker (defaults to Driveway)",
+                    "type": 3,
+                    "required": False,
+                    "choices": [
+                        {"name": "Driveway (annke_1)", "value": "annke_1"},
+                        {"name": "Loft (tapo_1)", "value": "tapo_1"},
+                        {"name": "Living Room (tapo_2)", "value": "tapo_2"},
+                    ],
+                },
+            ],
         },
     },
     {
@@ -448,7 +508,8 @@ async def _execute_command(
     cv_engine: EdgeCVEngine, cmd: str, arg: str = ""
 ) -> tuple[str, list[tuple[str, bytes, str]], list[dict]]:
     cmd = cmd.lower().strip()
-    arg = arg.strip().lower()
+    raw_arg = arg.strip()
+    arg = raw_arg.lower()
     now_ts = time.time()
     now_pt = datetime.now(LOCAL_TZ)
 
@@ -569,6 +630,87 @@ async def _execute_command(
         await set_mute_minutes_db(cv_engine, 0)
         return ("🔔 **PUSH ALERTS RESUMED** — Outbound notifications are active.", [], [])
 
+    if cmd in ("light", "floodlight"):
+        tokens = arg.split()
+        sub = tokens[0] if tokens else "status"
+        if sub == "status":
+            st = await camera_hardware_service.get_status("annke_1")
+            lt = st.get("light") or {}
+            return (
+                f"💡 **DRIVEWAY OPTICS STATUS (`{st.get('model', 'annke_1')}`)**\n"
+                f"Mode: **`{lt.get('mode', 'unknown').upper()}`** (`{lt.get('isapi_mode', '')}`) | "
+                f"White Brightness: **`{lt.get('white_brightness', 0)}%`** ({'AUTO' if lt.get('auto_brightness') else 'MANUAL'}) | "
+                f"RTSP Mic: **`{'ON' if st.get('mic_enabled') else 'OFF'}`**",
+                [],
+                [],
+            )
+        if sub == "smart_30":
+            tokens = ["smart", "30"]
+            sub = "smart"
+        if sub not in ("ir", "smart", "color", "off"):
+            return ("⚠️ Usage: `/light` or `!light [ir | smart 30 | color 35 | off | status]`", [], [])
+        w_br: int | None = None
+        auto_b: bool | None = None
+        if len(tokens) > 1:
+            if tokens[1] == "auto":
+                auto_b = True
+            elif tokens[1].isdigit():
+                w_br = max(5, min(100, int(tokens[1])))
+                auto_b = False
+        try:
+            st = await camera_hardware_service.set_light_config(
+                "annke_1", mode=sub, white_brightness=w_br, auto_brightness=auto_b
+            )
+            lt = st.get("light") or {}
+            return (
+                f"💡 **DRIVEWAY LIGHT UPDATED** → **`{lt.get('mode', sub).upper()}`** "
+                f"(White Floodlight: `{lt.get('white_brightness', 0)}%` {'AUTO' if lt.get('auto_brightness') else 'MANUAL'})",
+                [],
+                [],
+            )
+        except Exception as e:
+            return (f"⚠️ Failed to update Driveway light: `{e}`", [], [])
+
+    if cmd in ("say", "speak"):
+        if not raw_arg:
+            return ("⚠️ Usage: `/say message:<text> [camera]` or `!say [driveway|loft|living] <message>`", [], [])
+        cam_aliases = {
+            "driveway": "annke_1",
+            "annke_1": "annke_1",
+            "loft": "tapo_1",
+            "tapo_1": "tapo_1",
+            "living": "tapo_2",
+            "living_room": "tapo_2",
+            "tapo_2": "tapo_2",
+        }
+        target_cam = "annke_1"
+        msg_body = raw_arg
+        parts_say = raw_arg.split()
+        if len(parts_say) >= 2 and parts_say[0].lower() in cam_aliases:
+            target_cam = cam_aliases[parts_say[0].lower()]
+            msg_body = raw_arg.split(None, 1)[1].strip()
+        elif len(parts_say) >= 2 and parts_say[-1].lower() in cam_aliases:
+            target_cam = cam_aliases[parts_say[-1].lower()]
+            msg_body = raw_arg.rsplit(None, 1)[0].strip()
+
+        cam_label = CAM_NAMES.get(target_cam, target_cam.upper())
+        low_msg = msg_body.lower()
+        try:
+            if low_msg in ("chime", "siren"):
+                res = await camera_hardware_service.play_chime(target_cam, style="warning", announce_warning=(low_msg == "siren"))
+                return (f"🔊 **PLAYED {cam_label} DETERRENT CHIME** (`{res['duration_sec']}s` via `{res['transport']}`)", [], [])
+            if low_msg == "doorbell":
+                res = await camera_hardware_service.play_chime(target_cam, style="polite", announce_warning=False)
+                return (f"🔔 **PLAYED {cam_label} CHIME** (`{res['duration_sec']}s`)", [], [])
+            res = await camera_hardware_service.speak_text(target_cam, msg_body)
+            return (
+                f"🗣️ **SPOKE ON {cam_label} SPEAKER** (`{res['duration_sec']}s`):\n> \"{res['spoken_text']}\"",
+                [],
+                [],
+            )
+        except Exception as e:
+            return (f"⚠️ {cam_label} speaker failed: `{e}`", [], [])
+
     if cmd == "sitrep":
         res = await build_and_send_sitrep(
             cv_engine,
@@ -683,7 +825,7 @@ async def _handle_slash_interaction(cv_engine: EdgeCVEngine, token: str, d: dict
     data = d.get("data") or {}
     cmd_name = (data.get("name") or "").lower()
     opts = data.get("options") or []
-    first_arg = str(opts[0].get("value", "")) if opts else ""
+    first_arg = " ".join(str(o.get("value", "")).strip() for o in opts if o.get("value") is not None)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         await client.post(

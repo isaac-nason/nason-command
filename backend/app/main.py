@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 import cv2
 import httpx
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -46,6 +46,7 @@ from app.agent.orchestrator import (
     _scrub_parked_red_truck,
 )
 from app.services.perimeter_security import perimeter_service
+from app.services.camera_hardware import camera_hardware_service
 
 STREAMS = ["annke_1", "tapo_1", "tapo_2"]
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
@@ -707,6 +708,7 @@ async def lifespan(app: FastAPI):
         await perimeter_service.sync_with_away_mode(init_push.away_mode, init_push.away_armed_at)
     await sync_zones_to_engine(cv_engine)
     await sync_schedules_to_engine(cv_engine)
+    asyncio.create_task(camera_hardware_service.initialize_on_startup())
     cv_engine.start()
 
     ws_task = asyncio.create_task(telemetry_and_cv_broadcaster(cv_engine))
@@ -1674,4 +1676,115 @@ async def api_perimeter_bypass_open():
 @app.post("/api/perimeter/purge-breaches")
 async def api_perimeter_purge_breaches():
     return await purge_perimeter_breach_events()
+
+
+# --- Camera Hardware Controls: Supplement Floodlight, Live RTSP Mic & 2-Way Speaker ---
+class CameraLightDTO(BaseModel):
+    mode: str = "ir"
+    white_brightness: int | None = None
+    ir_brightness: int | None = None
+    auto_brightness: bool | None = None
+    hold_seconds: int | None = None
+
+
+class CameraAudioConfigDTO(BaseModel):
+    mic_enabled: bool | None = None
+    mic_volume: int | None = None
+    speaker_volume: int | None = None
+
+
+class CameraSpeakDTO(BaseModel):
+    text: str
+
+
+class CameraChimeDTO(BaseModel):
+    style: str = "warning"
+    announce_warning: bool = False
+
+
+class TapoAuthDTO(BaseModel):
+    cloud_password: str
+
+
+@app.post("/api/cameras/tapo/auth")
+async def api_set_tapo_cloud_auth(payload: TapoAuthDTO):
+    try:
+        return await camera_hardware_service.set_tapo_cloud_password(payload.cloud_password)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/cameras/{camera_id}/hardware")
+async def api_get_camera_hardware(camera_id: str):
+    return await camera_hardware_service.get_status(camera_id)
+
+
+@app.post("/api/cameras/{camera_id}/light")
+async def api_set_camera_light(camera_id: str, payload: CameraLightDTO):
+    try:
+        return await camera_hardware_service.set_light_config(
+            camera_id=camera_id,
+            mode=payload.mode,
+            white_brightness=payload.white_brightness,
+            ir_brightness=payload.ir_brightness,
+            auto_brightness=payload.auto_brightness,
+            hold_seconds=payload.hold_seconds,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/cameras/{camera_id}/audio-config")
+async def api_set_camera_audio_config(camera_id: str, payload: CameraAudioConfigDTO):
+    try:
+        return await camera_hardware_service.set_audio_config(
+            camera_id=camera_id,
+            mic_enabled=payload.mic_enabled,
+            mic_volume=payload.mic_volume,
+            speaker_volume=payload.speaker_volume,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/cameras/{camera_id}/speak")
+async def api_camera_speak(camera_id: str, payload: CameraSpeakDTO):
+    try:
+        return await camera_hardware_service.speak_text(camera_id, payload.text)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/cameras/{camera_id}/chime")
+async def api_camera_chime(camera_id: str, payload: CameraChimeDTO):
+    try:
+        return await camera_hardware_service.play_chime(
+            camera_id=camera_id,
+            style=payload.style,
+            announce_warning=payload.announce_warning,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/cameras/{camera_id}/talk")
+async def api_camera_push_to_talk(camera_id: str, request: Request):
+    raw_bytes = await request.body()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+    try:
+        return await camera_hardware_service.push_to_talk_raw(camera_id, raw_bytes)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
 

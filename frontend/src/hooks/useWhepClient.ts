@@ -5,6 +5,7 @@ export type StreamState = 'CONNECTING' | 'LIVE' | 'OFFLINE';
 export function useWhepClient(whepUrl: string) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [streamState, setStreamState] = useState<StreamState>('CONNECTING');
+  const [hasAudioTrack, setHasAudioTrack] = useState<boolean>(false);
 
   useEffect(() => {
     let pc: RTCPeerConnection | null = null;
@@ -23,6 +24,7 @@ export function useWhepClient(whepUrl: string) {
         pc.close();
         pc = null;
       }
+      setHasAudioTrack(false);
     };
 
     const scheduleReconnect = (delayMs = 3000) => {
@@ -37,6 +39,7 @@ export function useWhepClient(whepUrl: string) {
     const connectWhep = async () => {
       try {
         setStreamState('CONNECTING');
+        const combinedStream = new MediaStream();
         pc = new RTCPeerConnection({
           bundlePolicy: 'max-bundle',
         });
@@ -45,12 +48,23 @@ export function useWhepClient(whepUrl: string) {
         pc.addTransceiver('audio', { direction: 'recvonly' });
 
         pc.ontrack = (event) => {
-          if (event.track.kind === 'video' && videoRef.current && event.streams[0]) {
+          if (unmounted) return;
+          if (!combinedStream.getTracks().some((t) => t.id === event.track.id)) {
+            combinedStream.addTrack(event.track);
+          }
+          if (event.track.kind === 'audio') {
+            setHasAudioTrack(true);
+          }
+          if (videoRef.current) {
             const vid = videoRef.current;
-            vid.srcObject = event.streams[0];
-            vid.onloadeddata = () => {
-              if (!unmounted) setStreamState('LIVE');
-            };
+            if (vid.srcObject !== combinedStream) {
+              vid.srcObject = combinedStream;
+            }
+            if (event.track.kind === 'video') {
+              vid.onloadeddata = () => {
+                if (!unmounted) setStreamState('LIVE');
+              };
+            }
             vid.play().catch(() => {});
           }
         };
@@ -117,5 +131,5 @@ export function useWhepClient(whepUrl: string) {
     };
   }, [whepUrl]);
 
-  return { videoRef, streamState };
+  return { videoRef, streamState, hasAudioTrack };
 }

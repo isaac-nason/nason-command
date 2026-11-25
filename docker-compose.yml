@@ -80,6 +80,7 @@ services:
       start_period: 25s
     volumes:
       - ./backend/app:/app/app:ro
+      - ./mediamtx/mediamtx.yml:/tmp/mediamtx.yml:ro
       - ./runtime_data/snapshots:/tmp/command_snapshots
       - ./runtime_data/faces:/tmp/command_faces
       - ./runtime_data/backups:/tmp/command_backups

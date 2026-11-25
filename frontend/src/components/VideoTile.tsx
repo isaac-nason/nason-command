@@ -1,7 +1,32 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useWhepClient } from '../hooks/useWhepClient';
 import type { BoundingBoxDetection, CameraScheduleConfig, CameraZone, HeatmapPoint, ZonePoint } from '../types/telemetry';
-import { Bell, BellOff, Check, Clock, Crosshair, Database, Eye, EyeOff, Flame, Maximize2, Minimize2, PauseCircle, RotateCcw, ShieldAlert, ShieldOff, Trash2, X } from 'lucide-react';
+import { Bell, BellOff, Check, Clock, Crosshair, Database, Eye, EyeOff, Flame, Lightbulb, Maximize2, Mic, Minimize2, Moon, PauseCircle, Radio, RotateCcw, Send, ShieldAlert, ShieldOff, Siren, Sun, Trash2, Volume2, VolumeX, X } from 'lucide-react';
+
+interface CameraLightState {
+  mode: 'ir' | 'smart' | 'color' | 'off';
+  isapi_mode?: string;
+  auto_brightness: boolean;
+  white_brightness: number;
+  ir_brightness: number;
+  hold_seconds: number;
+}
+
+interface CameraHardwareStatus {
+  camera_id: string;
+  available: boolean;
+  vendor?: string;
+  model?: string;
+  supports_light: boolean;
+  supports_two_way_speaker: boolean;
+  tapo_auth_configured?: boolean;
+  supports_live_mic: boolean;
+  light?: CameraLightState;
+  mic_enabled?: boolean;
+  mic_volume?: number;
+  speaker_volume?: number;
+  speaker_busy?: boolean;
+}
 
 interface VideoTileProps {
   title: string;
@@ -71,7 +96,7 @@ export function VideoTile({
 }: VideoTileProps) {
   const whepUrl = `http://${hostIp}:8889/${streamName}/whep`;
   const apiBase = `http://${hostIp}:8080`;
-  const { videoRef, streamState } = useWhepClient(whepUrl);
+  const { videoRef, streamState, hasAudioTrack } = useWhepClient(whepUrl);
 
   const [trails, setTrails] = useState<Record<string, { category: string; points: TrailPoint[] }>>({});
   const [zoom, setZoom] = useState<number>(1);
@@ -93,6 +118,244 @@ export function VideoTile({
   const [schedEnd, setSchedEnd] = useState<string>('06:00');
   const [alertWhitelist, setAlertWhitelist] = useState<boolean>(false);
   const [silentLogging, setSilentLogging] = useState<boolean>(false);
+
+  // Live WebRTC Microphone Listen + Hardware Light & 2-Way Speaker Intercom State
+  const [liveAudioOn, setLiveAudioOn] = useState<boolean>(false);
+  const [hwStatus, setHwStatus] = useState<CameraHardwareStatus | null>(null);
+  const [showLightModal, setShowLightModal] = useState<boolean>(false);
+  const [showTalkModal, setShowTalkModal] = useState<boolean>(false);
+  const [lightBusy, setLightBusy] = useState<boolean>(false);
+  const [draftWhiteBr, setDraftWhiteBr] = useState<number>(35);
+  const [draftAutoBr, setDraftAutoBr] = useState<boolean>(false);
+  const [draftMicVol, setDraftMicVol] = useState<number>(85);
+  const [draftSpkVol, setDraftSpkVol] = useState<number>(85);
+  const [draftMicEnabled, setDraftMicEnabled] = useState<boolean>(true);
+
+  const [ttsText, setTtsText] = useState<string>('');
+  const [talkBusy, setTalkBusy] = useState<boolean>(false);
+  const [talkStatusMsg, setTalkStatusMsg] = useState<string>('');
+  const [isRecordingPtt, setIsRecordingPtt] = useState<boolean>(false);
+  const [tapoPassInput, setTapoPassInput] = useState<string>('');
+  const [showTapoRelink, setShowTapoRelink] = useState<boolean>(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const pttChunksRef = useRef<BlobPart[]>([]);
+  const pttStreamRef = useRef<MediaStream | null>(null);
+  const canBrowserMic = typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia);
+
+  const linkTapoSpeakers = async () => {
+    const pw = tapoPassInput.trim();
+    if (!pw || talkBusy) return;
+    setTalkBusy(true);
+    setTalkStatusMsg('Verifying with Tapo C113 on LAN...');
+    try {
+      const res = await fetch(`${apiBase}/api/cameras/tapo/auth`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cloud_password: pw }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setTapoPassInput('');
+        setShowTapoRelink(false);
+        setTalkStatusMsg('Linked! Loft & Living Room speakers ready.');
+        await refreshHardwareStatus();
+      } else {
+        setTalkStatusMsg(data.detail || 'Tapo password verification failed');
+      }
+    } catch {
+      setTalkStatusMsg('Could not reach backend');
+    } finally {
+      setTalkBusy(false);
+    }
+  };
+
+  const refreshHardwareStatus = async () => {
+    try {
+      const res = await fetch(`${apiBase}/api/cameras/${streamName}/hardware`);
+      if (!res.ok) return;
+      const data: CameraHardwareStatus = await res.json();
+      setHwStatus(data);
+      if (data.light) {
+        setDraftWhiteBr(data.light.white_brightness);
+        setDraftAutoBr(data.light.auto_brightness);
+      }
+      if (typeof data.mic_volume === 'number') setDraftMicVol(data.mic_volume);
+      if (typeof data.speaker_volume === 'number') setDraftSpkVol(data.speaker_volume);
+      if (typeof data.mic_enabled === 'boolean') setDraftMicEnabled(data.mic_enabled);
+    } catch {
+      // ignore transient offline
+    }
+  };
+
+  useEffect(() => {
+    refreshHardwareStatus();
+  }, [apiBase, streamName]);
+
+  const toggleLiveAudio = () => {
+    setLiveAudioOn((prev) => {
+      const next = !prev;
+      if (videoRef.current) {
+        videoRef.current.muted = !next;
+        videoRef.current.volume = 1.0;
+        if (next) videoRef.current.play().catch(() => {});
+      }
+      return next;
+    });
+  };
+
+  const applyLightConfig = async (
+    mode: 'ir' | 'smart' | 'color' | 'off',
+    whiteBrOverride?: number,
+    autoOverride?: boolean
+  ) => {
+    setLightBusy(true);
+    try {
+      const res = await fetch(`${apiBase}/api/cameras/${streamName}/light`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode,
+          white_brightness: whiteBrOverride !== undefined ? whiteBrOverride : draftWhiteBr,
+          auto_brightness: autoOverride !== undefined ? autoOverride : draftAutoBr,
+        }),
+      });
+      if (res.ok) {
+        const updated: CameraHardwareStatus = await res.json();
+        setHwStatus(updated);
+        if (updated.light) {
+          setDraftWhiteBr(updated.light.white_brightness);
+          setDraftAutoBr(updated.light.auto_brightness);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to update camera light:', err);
+    } finally {
+      setLightBusy(false);
+    }
+  };
+
+  const saveCameraAudioHw = async (micEnabledOverride?: boolean) => {
+    setLightBusy(true);
+    try {
+      const res = await fetch(`${apiBase}/api/cameras/${streamName}/audio-config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mic_enabled: micEnabledOverride !== undefined ? micEnabledOverride : draftMicEnabled,
+          mic_volume: draftMicVol,
+          speaker_volume: draftSpkVol,
+        }),
+      });
+      if (res.ok) {
+        const updated: CameraHardwareStatus = await res.json();
+        setHwStatus(updated);
+        if (typeof updated.mic_enabled === 'boolean') setDraftMicEnabled(updated.mic_enabled);
+      }
+    } catch (err) {
+      console.error('Failed to update camera audio config:', err);
+    } finally {
+      setLightBusy(false);
+    }
+  };
+
+  const sendSpeakerMessage = async (textOrPreset: string) => {
+    const clean = textOrPreset.trim();
+    if (!clean || talkBusy) return;
+    setTalkBusy(true);
+    setTalkStatusMsg('Broadcasting to speaker...');
+    try {
+      const res = await fetch(`${apiBase}/api/cameras/${streamName}/speak`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: clean }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setTalkStatusMsg(`Played (${data.duration_sec}s)`);
+        if (clean === ttsText.trim()) setTtsText('');
+      } else {
+        setTalkStatusMsg(data.detail || 'Speaker error');
+      }
+    } catch {
+      setTalkStatusMsg('Failed to reach speaker');
+    } finally {
+      setTalkBusy(false);
+    }
+  };
+
+  const triggerSpeakerChime = async (style: 'polite' | 'warning', announceWarning = false) => {
+    if (talkBusy) return;
+    setTalkBusy(true);
+    setTalkStatusMsg(style === 'warning' ? 'Sounding deterrent chime...' : 'Ringing chime...');
+    try {
+      const res = await fetch(`${apiBase}/api/cameras/${streamName}/chime`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ style, announce_warning: announceWarning }),
+      });
+      const data = await res.json();
+      setTalkStatusMsg(res.ok ? `Played (${data.duration_sec}s)` : data.detail || 'Chime error');
+    } catch {
+      setTalkStatusMsg('Failed to reach speaker');
+    } finally {
+      setTalkBusy(false);
+    }
+  };
+
+  const startPushToTalk = async () => {
+    if (!canBrowserMic || isRecordingPtt || talkBusy) return;
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      pttStreamRef.current = micStream;
+      pttChunksRef.current = [];
+      const rec = new MediaRecorder(micStream);
+      rec.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) pttChunksRef.current.push(ev.data);
+      };
+      rec.onstop = async () => {
+        micStream.getTracks().forEach((t) => t.stop());
+        pttStreamRef.current = null;
+        const blob = new Blob(pttChunksRef.current, { type: rec.mimeType || 'audio/webm' });
+        pttChunksRef.current = [];
+        if (blob.size < 400) {
+          setTalkStatusMsg('Hold button slightly longer to speak');
+          return;
+        }
+        setTalkBusy(true);
+        setTalkStatusMsg('Transmitting voice to speaker...');
+        try {
+          const buf = await blob.arrayBuffer();
+          const res = await fetch(`${apiBase}/api/cameras/${streamName}/talk`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: buf,
+          });
+          const data = await res.json();
+          setTalkStatusMsg(res.ok ? `Voice sent (${data.duration_sec}s)` : data.detail || 'PTT error');
+        } catch {
+          setTalkStatusMsg('Failed to transmit voice');
+        } finally {
+          setTalkBusy(false);
+        }
+      };
+      mediaRecorderRef.current = rec;
+      rec.start();
+      setIsRecordingPtt(true);
+      setTalkStatusMsg('🎙️ Recording... release to broadcast');
+    } catch {
+      setTalkStatusMsg('Mic permission denied or unavailable');
+    }
+  };
+
+  const stopPushToTalk = () => {
+    if (!isRecordingPtt) return;
+    setIsRecordingPtt(false);
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+  };
 
   useEffect(() => {
     if (schedule) {
@@ -354,7 +617,7 @@ export function VideoTile({
           ref={videoRef}
           autoPlay
           playsInline
-          muted
+          muted={!liveAudioOn || isRecordingPtt}
           className="w-full h-full object-cover"
         />
 
@@ -571,7 +834,92 @@ export function VideoTile({
           ) : (
             <>
               <button
-                onClick={() => setShowSchedModal((prev) => !prev)}
+                onClick={toggleLiveAudio}
+                title={
+                  liveAudioOn
+                    ? 'Live Camera Microphone UNMUTED — Click to mute'
+                    : hasAudioTrack
+                    ? 'Unmute Live Camera Microphone (WebRTC Audio Ready)'
+                    : 'Unmute Live Camera Microphone'
+                }
+                className={`px-1.5 py-1 rounded text-[10px] font-mono font-bold border flex items-center gap-1 cursor-pointer transition-colors ${
+                  liveAudioOn
+                    ? 'bg-emerald-600 text-white border-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.5)]'
+                    : 'bg-zinc-950/85 hover:bg-zinc-800 text-zinc-400 border-zinc-800'
+                }`}
+              >
+                {liveAudioOn ? <Volume2 className="w-3 h-3" /> : <VolumeX className="w-3 h-3" />}
+                <span className="hidden sm:inline">{liveAudioOn ? 'MIC·ON' : 'MIC'}</span>
+              </button>
+
+              {hwStatus?.supports_light && (
+                <button
+                  onClick={() => {
+                    setShowTalkModal(false);
+                    setShowSchedModal(false);
+                    setShowLightModal((prev) => {
+                      const next = !prev;
+                      if (next) refreshHardwareStatus();
+                      return next;
+                    });
+                  }}
+                  title="Configure Camera Night Vision, White Floodlight & Hardware Audio"
+                  className={`px-1.5 py-1 rounded text-[10px] font-mono font-bold border flex items-center gap-1 cursor-pointer transition-colors ${
+                    hwStatus.light?.mode === 'ir'
+                      ? 'bg-indigo-950/90 text-indigo-300 border-indigo-500/60'
+                      : hwStatus.light?.mode === 'color'
+                      ? 'bg-amber-500 text-zinc-950 border-amber-300'
+                      : hwStatus.light?.mode === 'off'
+                      ? 'bg-zinc-900 text-zinc-400 border-zinc-700'
+                      : 'bg-zinc-950/85 hover:bg-zinc-800 text-amber-300 border-zinc-800'
+                  }`}
+                >
+                  {hwStatus.light?.mode === 'ir' ? (
+                    <Moon className="w-3 h-3" />
+                  ) : hwStatus.light?.mode === 'color' ? (
+                    <Sun className="w-3 h-3" />
+                  ) : (
+                    <Lightbulb className="w-3 h-3" />
+                  )}
+                  <span className="hidden sm:inline">
+                    {hwStatus.light?.mode === 'ir'
+                      ? 'IR·ONLY'
+                      : hwStatus.light?.mode === 'color'
+                      ? `FLOOD·${hwStatus.light.white_brightness}%`
+                      : hwStatus.light?.mode === 'off'
+                      ? 'LIGHT·OFF'
+                      : `SMART·${hwStatus.light?.auto_brightness ? 'AUTO' : `${hwStatus.light?.white_brightness ?? 100}%`}`}
+                  </span>
+                </button>
+              )}
+
+              {hwStatus?.supports_two_way_speaker && (
+                <button
+                  onClick={() => {
+                    setShowLightModal(false);
+                    setShowSchedModal(false);
+                    setShowTalkModal((prev) => !prev);
+                  }}
+                  title="2-Way Camera Speaker Intercom, Voice Presets & Deterrent Chime"
+                  className={`px-1.5 py-1 rounded text-[10px] font-mono font-bold border flex items-center gap-1 cursor-pointer transition-colors ${
+                    isRecordingPtt
+                      ? 'bg-red-600 text-white border-red-300 animate-pulse'
+                      : showTalkModal
+                      ? 'bg-cyan-600 text-white border-cyan-300'
+                      : 'bg-zinc-950/85 hover:bg-zinc-800 text-cyan-300 border-zinc-800'
+                  }`}
+                >
+                  <Radio className="w-3 h-3" />
+                  <span className="hidden sm:inline">TALK</span>
+                </button>
+              )}
+
+              <button
+                onClick={() => {
+                  setShowLightModal(false);
+                  setShowTalkModal(false);
+                  setShowSchedModal((prev) => !prev);
+                }}
                 title="Configure Recording / Pause Schedule"
                 className={`px-1.5 py-1 rounded text-[10px] font-mono font-bold border flex items-center gap-1 cursor-pointer transition-colors ${
                   schedule?.away_override
@@ -866,6 +1214,342 @@ export function VideoTile({
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {showLightModal && hwStatus?.supports_light && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="absolute top-11 right-2 z-30 bg-zinc-950/95 border border-zinc-700 rounded-lg p-3 w-72 shadow-2xl font-mono text-xs space-y-2.5"
+        >
+          <div className="flex items-center justify-between border-b border-zinc-800 pb-1.5">
+            <span className="font-bold text-amber-300">{title} // OPTICS & AUDIO</span>
+            <button onClick={() => setShowLightModal(false)} className="text-zinc-400 hover:text-white cursor-pointer">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div className="space-y-1.5">
+            <div className="text-[10px] text-zinc-400 font-bold">NIGHT SUPPLEMENT LIGHT MODE:</div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                disabled={lightBusy}
+                onClick={() => applyLightConfig('ir')}
+                title="Invisible IR LEDs only — White floodlight NEVER turns on (zero reflective vest glare)"
+                className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
+                  hwStatus.light?.mode === 'ir'
+                    ? 'bg-indigo-600 text-white border-indigo-300'
+                    : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border-zinc-800'
+                }`}
+              >
+                <Moon className="w-3 h-3" />
+                IR ONLY (NO FLOOD)
+              </button>
+              <button
+                disabled={lightBusy}
+                onClick={() => applyLightConfig('smart', 30, false)}
+                title="IR until person detected, then gentle 30% white floodlight so vests & plates don't blow out"
+                className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
+                  hwStatus.light?.mode === 'smart' && !hwStatus.light?.auto_brightness
+                    ? 'bg-amber-600 text-white border-amber-300'
+                    : 'bg-zinc-900 hover:bg-zinc-800 text-amber-300 border-zinc-800'
+                }`}
+              >
+                <Lightbulb className="w-3 h-3" />
+                SMART · 30%
+              </button>
+              <button
+                disabled={lightBusy}
+                onClick={() => applyLightConfig('color', draftWhiteBr, false)}
+                title="Keep white color floodlight on continuously at night"
+                className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
+                  hwStatus.light?.mode === 'color'
+                    ? 'bg-amber-500 text-zinc-950 border-amber-200'
+                    : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border-zinc-800'
+                }`}
+              >
+                <Sun className="w-3 h-3" />
+                ALWAYS COLOR
+              </button>
+              <button
+                disabled={lightBusy}
+                onClick={() => applyLightConfig('off')}
+                title="Turn off both IR and white LEDs (use street/porch light only)"
+                className={`py-1.5 px-2 rounded text-[10px] font-bold border flex items-center justify-center gap-1 cursor-pointer ${
+                  hwStatus.light?.mode === 'off'
+                    ? 'bg-zinc-700 text-white border-zinc-400'
+                    : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-400 border-zinc-800'
+                }`}
+              >
+                ALL LIGHTS OFF
+              </button>
+            </div>
+          </div>
+
+          {hwStatus.light?.mode !== 'ir' && hwStatus.light?.mode !== 'off' && (
+            <div className="space-y-1.5 pt-1.5 border-t border-zinc-800">
+              <div className="flex items-center justify-between text-[10px]">
+                <span className="text-zinc-400">FLOODLIGHT LEVEL:</span>
+                <span className="text-amber-300 font-bold">
+                  {draftAutoBr ? 'AUTO (100%)' : `${draftWhiteBr}% MANUAL`}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min={5}
+                  max={100}
+                  step={5}
+                  value={draftWhiteBr}
+                  onChange={(e) => {
+                    setDraftAutoBr(false);
+                    setDraftWhiteBr(Number(e.target.value));
+                  }}
+                  className="flex-1 accent-amber-400 cursor-pointer"
+                />
+                <button
+                  disabled={lightBusy}
+                  onClick={() => applyLightConfig(hwStatus.light?.mode || 'smart', draftWhiteBr, false)}
+                  className="bg-amber-600 hover:bg-amber-500 text-white px-2 py-1 rounded text-[10px] font-bold cursor-pointer"
+                >
+                  SET
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="space-y-2 pt-2 border-t border-zinc-800">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] text-zinc-400 font-bold">CAMERA RTSP MIC STREAM:</span>
+              <button
+                disabled={lightBusy}
+                onClick={() => {
+                  const next = !draftMicEnabled;
+                  setDraftMicEnabled(next);
+                  saveCameraAudioHw(next);
+                }}
+                className={`px-2 py-0.5 rounded text-[10px] font-bold border cursor-pointer ${
+                  draftMicEnabled
+                    ? 'bg-emerald-600 text-white border-emerald-400'
+                    : 'bg-zinc-900 text-zinc-400 border-zinc-700'
+                }`}
+              >
+                {draftMicEnabled ? 'ENABLED' : 'DISABLED'}
+              </button>
+            </div>
+            <div className="flex items-center justify-between gap-2 text-[10px]">
+              <span className="text-zinc-400 w-16">MIC {draftMicVol}%</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={draftMicVol}
+                onChange={(e) => setDraftMicVol(Number(e.target.value))}
+                className="flex-1 accent-emerald-400 cursor-pointer"
+              />
+            </div>
+            <div className="flex items-center justify-between gap-2 text-[10px]">
+              <span className="text-zinc-400 w-16">SPK {draftSpkVol}%</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={draftSpkVol}
+                onChange={(e) => setDraftSpkVol(Number(e.target.value))}
+                className="flex-1 accent-cyan-400 cursor-pointer"
+              />
+              <button
+                disabled={lightBusy}
+                onClick={() => saveCameraAudioHw()}
+                className="bg-zinc-800 hover:bg-zinc-700 border border-zinc-600 text-zinc-200 px-2 py-0.5 rounded text-[10px] font-bold cursor-pointer"
+              >
+                SAVE
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showTalkModal && hwStatus?.supports_two_way_speaker && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="absolute top-11 right-2 z-30 bg-zinc-950/95 border border-cyan-500/50 rounded-lg p-3 w-76 shadow-2xl font-mono text-xs space-y-2.5"
+        >
+          <div className="flex items-center justify-between border-b border-zinc-800 pb-1.5">
+            <span className="font-bold text-cyan-300">{title} // 2-WAY SPEAKER</span>
+            <div className="flex items-center gap-2">
+              {hwStatus.vendor === 'tapo_rtsp' && hwStatus.tapo_auth_configured && (
+                <button
+                  onClick={() => setShowTapoRelink((prev) => !prev)}
+                  title="Update TP-Link / Tapo Cloud password hash"
+                  className="text-[10px] text-zinc-400 hover:text-cyan-300 cursor-pointer"
+                >
+                  RE-LINK
+                </button>
+              )}
+              <button onClick={() => setShowTalkModal(false)} className="text-zinc-400 hover:text-white cursor-pointer">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {hwStatus.vendor === 'tapo_rtsp' && (!hwStatus.tapo_auth_configured || showTapoRelink) ? (
+            <div className="space-y-2 bg-zinc-900/90 border border-amber-500/40 rounded p-2.5">
+              <div className="text-[10px] text-amber-200 leading-snug">
+                <span className="font-bold">1-Time Tapo Speaker Link:</span> Enter your TP-Link / Tapo app password (verified live & stored only as a SHA-256 hash; unlocks both Loft & Living Room).
+              </div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="password"
+                  value={tapoPassInput}
+                  onChange={(e) => setTapoPassInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') linkTapoSpeakers();
+                  }}
+                  placeholder="TP-Link / Tapo app password..."
+                  className="flex-1 bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-100 placeholder:text-zinc-500"
+                />
+                <button
+                  disabled={talkBusy || !tapoPassInput.trim()}
+                  onClick={linkTapoSpeakers}
+                  className="bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white px-2.5 py-1 rounded text-[10px] font-bold cursor-pointer"
+                >
+                  LINK
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              {canBrowserMic ? (
+                <button
+                  disabled={talkBusy && !isRecordingPtt}
+                  onMouseDown={startPushToTalk}
+                  onMouseUp={stopPushToTalk}
+                  onMouseLeave={stopPushToTalk}
+                  onTouchStart={(e) => {
+                    e.preventDefault();
+                    startPushToTalk();
+                  }}
+                  onTouchEnd={(e) => {
+                    e.preventDefault();
+                    stopPushToTalk();
+                  }}
+                  className={`w-full py-2 rounded font-bold text-[11px] border flex items-center justify-center gap-1.5 cursor-pointer select-none transition-colors ${
+                    isRecordingPtt
+                      ? 'bg-red-600 text-white border-red-300 animate-pulse'
+                      : 'bg-cyan-950/90 hover:bg-cyan-900 text-cyan-200 border-cyan-500/60'
+                  }`}
+                >
+                  <Mic className="w-3.5 h-3.5" />
+                  {isRecordingPtt ? 'RELEASE TO BROADCAST' : 'HOLD TO TALK (LIVE MIC)'}
+                </button>
+              ) : (
+                <div className="text-[10px] text-zinc-400 bg-zinc-900/90 border border-zinc-800 rounded px-2 py-1.5 leading-snug">
+                  Browser live mic requires HTTPS/localhost — quick presets & custom voice below work over HTTP!
+                </div>
+              )}
+
+              {hwStatus.vendor === 'tapo_rtsp' ? (
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    disabled={talkBusy}
+                    onClick={() => sendSpeakerMessage('dinner_ready')}
+                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-amber-300 font-bold cursor-pointer text-left"
+                  >
+                    🍽️ Dinner's Ready
+                  </button>
+                  <button
+                    disabled={talkBusy}
+                    onClick={() => sendSpeakerMessage('check_in')}
+                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-emerald-300 font-bold cursor-pointer text-left"
+                  >
+                    👋 Check In
+                  </button>
+                  <button
+                    disabled={talkBusy}
+                    onClick={() => sendSpeakerMessage('coming_out')}
+                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-zinc-300 font-bold cursor-pointer text-left"
+                  >
+                    🏃 One Moment
+                  </button>
+                  <button
+                    disabled={talkBusy}
+                    onClick={() => triggerSpeakerChime('polite', false)}
+                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-sky-300 font-bold cursor-pointer text-left"
+                  >
+                    🔔 Polite Chime
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    disabled={talkBusy}
+                    onClick={() => sendSpeakerMessage('leave_door')}
+                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-amber-300 font-bold cursor-pointer text-left"
+                  >
+                    📦 Leave at Door
+                  </button>
+                  <button
+                    disabled={talkBusy}
+                    onClick={() => sendSpeakerMessage('coming_out')}
+                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-emerald-300 font-bold cursor-pointer text-left"
+                  >
+                    👋 Coming Out
+                  </button>
+                  <button
+                    disabled={talkBusy}
+                    onClick={() => sendSpeakerMessage('no_soliciting')}
+                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-zinc-300 font-bold cursor-pointer text-left"
+                  >
+                    🚫 No Soliciting
+                  </button>
+                  <button
+                    disabled={talkBusy}
+                    onClick={() => triggerSpeakerChime('polite', false)}
+                    className="bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 py-1.5 px-2 rounded text-[10px] text-sky-300 font-bold cursor-pointer text-left"
+                  >
+                    🔔 Polite Chime
+                  </button>
+                </div>
+              )}
+
+              <button
+                disabled={talkBusy}
+                onClick={() => triggerSpeakerChime('warning', true)}
+                className="w-full bg-red-950/90 hover:bg-red-900 border border-red-500/60 py-1.5 px-2 rounded text-[10px] text-red-200 font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Siren className="w-3.5 h-3.5 text-red-400" />
+                SIREN CHIME + RECORDING WARNING
+              </button>
+
+              <div className="flex items-center gap-1.5 pt-1 border-t border-zinc-800">
+                <input
+                  type="text"
+                  value={ttsText}
+                  onChange={(e) => setTtsText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') sendSpeakerMessage(ttsText);
+                  }}
+                  placeholder="Type custom message to speak..."
+                  className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-100 placeholder:text-zinc-500"
+                />
+                <button
+                  disabled={talkBusy || !ttsText.trim()}
+                  onClick={() => sendSpeakerMessage(ttsText)}
+                  className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white px-2.5 py-1 rounded text-[10px] font-bold flex items-center gap-1 cursor-pointer"
+                >
+                  <Send className="w-3 h-3" />
+                  SAY
+                </button>
+              </div>
+            </>
+          )}
+
+          {talkStatusMsg && (
+            <div className="text-[10px] text-cyan-300 truncate pt-0.5">{talkStatusMsg}</div>
+          )}
         </div>
       )}
     </div>
