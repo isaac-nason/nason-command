@@ -1548,7 +1548,7 @@ export function VideoTile({
           )}
 
           {talkStatusMsg && (
-            <div className="text-[10px] text-cyan-300 truncate pt-0.5">{talkStatusMsg}</div>
+            <div className="text-[10px] text-cyan-300 break-words leading-snug pt-0.5">{talkStatusMsg}</div>
           )}
         </div>
       )}

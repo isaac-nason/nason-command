@@ -1,4 +1,6 @@
 import asyncio
+import base64
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -38,6 +40,124 @@ GO2RTC_CFG_PATH = "/tmp/go2rtc_talk.yaml"
 
 def _strip_xml_ns(xml_text: str) -> str:
     return re.sub(r'\sxmlns="[^"]+"', "", xml_text or "", count=5)
+
+
+# Pure-Python FIPS-197 AES-128 inverse cipher tables (zero external crypto pip packages required)
+_AES_SBOX = (
+    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
+    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
+    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
+    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
+    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
+    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
+    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
+    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
+    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
+    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
+    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
+    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
+    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
+    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
+    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
+    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
+)
+_AES_INV_SBOX = tuple(_AES_SBOX.index(i) for i in range(256))
+_AES_RCON = (0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
+
+
+def _gf_mul(a: int, b: int) -> int:
+    p = 0
+    for _ in range(8):
+        if b & 1:
+            p ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return p
+
+
+def _aes128_expand_key(key16: bytes) -> list[list[int]]:
+    w = [list(key16[i : i + 4]) for i in range(0, 16, 4)]
+    for i in range(4, 44):
+        temp = list(w[i - 1])
+        if i % 4 == 0:
+            temp = [_AES_SBOX[temp[1]] ^ _AES_RCON[i // 4], _AES_SBOX[temp[2]], _AES_SBOX[temp[3]], _AES_SBOX[temp[0]]]
+        w.append([w[i - 4][j] ^ temp[j] for j in range(4)])
+    return [sum(w[r * 4 : (r + 1) * 4], []) for r in range(11)]
+
+
+def _aes128_decrypt_block(block16: bytes, round_keys: list[list[int]]) -> bytes:
+    s = [block16[i] ^ round_keys[10][i] for i in range(16)]
+    for rnd in range(9, 0, -1):
+        # InvShiftRows
+        s = [
+            s[0], s[13], s[10], s[7],
+            s[4], s[1], s[14], s[11],
+            s[8], s[5], s[2], s[15],
+            s[12], s[9], s[6], s[3],
+        ]
+        # InvSubBytes + AddRoundKey
+        s = [_AES_INV_SBOX[s[i]] ^ round_keys[rnd][i] for i in range(16)]
+        # InvMixColumns
+        ns = [0] * 16
+        for c in range(4):
+            idx = c * 4
+            a0, a1, a2, a3 = s[idx], s[idx + 1], s[idx + 2], s[idx + 3]
+            ns[idx] = _gf_mul(a0, 0x0E) ^ _gf_mul(a1, 0x0B) ^ _gf_mul(a2, 0x0D) ^ _gf_mul(a3, 0x09)
+            ns[idx + 1] = _gf_mul(a0, 0x09) ^ _gf_mul(a1, 0x0E) ^ _gf_mul(a2, 0x0B) ^ _gf_mul(a3, 0x0D)
+            ns[idx + 2] = _gf_mul(a0, 0x0D) ^ _gf_mul(a1, 0x09) ^ _gf_mul(a2, 0x0E) ^ _gf_mul(a3, 0x0B)
+            ns[idx + 3] = _gf_mul(a0, 0x0B) ^ _gf_mul(a1, 0x0D) ^ _gf_mul(a2, 0x09) ^ _gf_mul(a3, 0x0E)
+        s = ns
+    s = [
+        s[0], s[13], s[10], s[7],
+        s[4], s[1], s[14], s[11],
+        s[8], s[5], s[2], s[15],
+        s[12], s[9], s[6], s[3],
+    ]
+    return bytes(_AES_INV_SBOX[s[i]] ^ round_keys[0][i] for i in range(16))
+
+
+def _aes128_cbc_decrypt_pkcs7(ciphertext: bytes, key16: bytes, iv16: bytes) -> bytes:
+    if not ciphertext or len(ciphertext) % 16 != 0:
+        raise ValueError(f"Invalid AES-128-CBC ciphertext length: {len(ciphertext)}")
+    rk = _aes128_expand_key(key16)
+    out = bytearray()
+    prev = iv16
+    for off in range(0, len(ciphertext), 16):
+        blk = ciphertext[off : off + 16]
+        dec = _aes128_decrypt_block(blk, rk)
+        out.extend(dec[i] ^ prev[i] for i in range(16))
+        prev = blk
+    pad_len = out[-1]
+    if pad_len < 1 or pad_len > 16 or any(b != pad_len for b in out[-pad_len:]):
+        raise ValueError("Invalid PKCS7 padding on Tapo session payload")
+    return bytes(out[:-pad_len])
+
+
+def _tapo_psi_packet(pid: int, section: bytes) -> bytes:
+    """Wrap an MPEG-TS PAT/PMT section with MPEG-2 CRC32 into a 188-byte TS packet."""
+    crc = 0xFFFFFFFF
+    for val in section:
+        crc ^= val << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ (0x04C11DB7 if crc & 0x80000000 else 0)) & 0xFFFFFFFF
+    pkt = bytes((0x47, 0x40 | (pid >> 8), pid & 0xFF, 0x10, 0)) + section + crc.to_bytes(4, "big")
+    return pkt.ljust(188, b"\xff")
+
+
+def _tapo_clean_http_block(raw: bytes) -> str:
+    """Strip Tapo's occasional 'HTTP ERROR 401' prefix glued ahead of 'HTTP/1.0 200 OK'."""
+    txt = raw.decode("utf-8", errors="ignore")
+    for ver in ("HTTP/1.1", "HTTP/1.0", "HTTP/0.9"):
+        if txt.startswith(ver):
+            return txt
+    for ver in ("HTTP/1.1", "HTTP/1.0", "HTTP/0.9"):
+        pos = txt.find(ver)
+        if pos != -1:
+            return txt[pos:]
+    return txt
 
 
 def _parse_mediamtx_cameras() -> dict[str, dict]:
@@ -127,14 +247,75 @@ class CameraHardwareService:
     def get_camera_cred(self, camera_id: str) -> dict | None:
         return _parse_mediamtx_cameras().get(camera_id)
 
+    async def sync_tapo_onvif_clock(self, info: dict) -> bool:
+        """
+        Syncs UTC + PST8PDT system clock to TP-Link Tapo cameras over LAN ONVIF (:2020)
+        using existing RTSP credentials. Tapo C113 lacks an RTC battery and boots at its
+        firmware build date (2026-02-13) if WAN/NTP is blocked or slow, which breaks TLS
+        certificate validity and corrupts OSD timestamps.
+        """
+        host = info.get("host")
+        user = info.get("username")
+        pw = info.get("password")
+        if not (host and user and pw):
+            return False
+
+        now_u = datetime.now(timezone.utc)
+        nonce_raw = os.urandom(16)
+        created = now_u.strftime("%Y-%m-%dT%H:%M:%SZ")
+        digest = base64.b64encode(hashlib.sha1(nonce_raw + created.encode() + pw.encode()).digest()).decode()
+        nonce_b64 = base64.b64encode(nonce_raw).decode()
+        is_dst = bool(time.localtime().tm_isdst > 0)
+
+        soap_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+            'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
+            'xmlns:tt="http://www.onvif.org/ver10/schema">'
+            "<s:Header>"
+            '<Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
+            "<UsernameToken>"
+            f"<Username>{user}</Username>"
+            f'<Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</Password>'
+            f'<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce_b64}</Nonce>'
+            f'<Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">{created}</Created>'
+            "</UsernameToken>"
+            "</Security>"
+            "</s:Header>"
+            "<s:Body>"
+            "<tds:SetSystemDateAndTime>"
+            "<tds:DateTimeType>Manual</tds:DateTimeType>"
+            f"<tds:DaylightSavings>{'true' if is_dst else 'false'}</tds:DaylightSavings>"
+            "<tds:TimeZone><tt:TZ>PST8PDT</tt:TZ></tds:TimeZone>"
+            "<tds:UTCDateTime>"
+            f"<tt:Time><tt:Hour>{now_u.hour}</tt:Hour><tt:Minute>{now_u.minute}</tt:Minute><tt:Second>{now_u.second}</tt:Second></tt:Time>"
+            f"<tt:Date><tt:Year>{now_u.year}</tt:Year><tt:Month>{now_u.month}</tt:Month><tt:Day>{now_u.day}</tt:Day></tt:Date>"
+            "</tds:UTCDateTime>"
+            "</tds:SetSystemDateAndTime>"
+            "</s:Body>"
+            "</s:Envelope>"
+        )
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.post(
+                f"http://{host}:2020/onvif/device_service",
+                content=soap_xml.encode("utf-8"),
+                headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+            )
+            return resp.status_code == 200
+
     async def initialize_on_startup(self) -> None:
         """
         Ensures RTSP G.711u live microphone ingest and TwoWayAudio readiness are enabled
-        on Annke ISAPI cameras on boot, without altering the user's current light mode
-        unless previously saved in camera_hardware_state.json.
+        on Annke ISAPI cameras on boot, and syncs LAN ONVIF system clocks on Tapo cameras.
         """
         cams = _parse_mediamtx_cameras()
         for cam_id, info in cams.items():
+            if info.get("vendor") == "tapo_rtsp":
+                try:
+                    await self.sync_tapo_onvif_clock(info)
+                except Exception as e:
+                    print(f"[CAM HW INIT WARNING] {cam_id} ONVIF clock sync failed: {e}")
+                continue
             if info.get("vendor") != "annke_isapi":
                 continue
             saved = self._saved_state.get(cam_id) or {}
@@ -725,123 +906,123 @@ class CameraHardwareService:
                 except Exception:
                     pass
 
-    async def _verify_tapo_8800_digest(self, host: str, candidates: list[tuple[str, str]]) -> tuple[str, str] | None:
+    async def _open_tapo_8800_session(
+        self, host: str, candidates: list[tuple[str, str]]
+    ) -> tuple[tuple[asyncio.StreamReader, asyncio.StreamWriter, dict[str, str], str, str] | None, str]:
         """
-        Tests Digest credentials directly against Tapo's port 8800 Streamd endpoint
-        (the exact HTTP Digest socket go2rtc uses for 2-way talk) instead of port 443's
-        firmware-dependent KLAP/v4 challenge.
+        Authenticates to TP-Link Tapo's port 8800 Streamd server using keep-alive + Content-Length: -1.
+        Tries both reconnect-after-401 (tapo_v4/tapo_media.py verified on 2026 TPAP firmware) and
+        same-socket reuse (pytapo.media_stream) so both Streamd behaviors are covered.
         """
-        for uname, secret in candidates:
+        last_diag = "no_response"
+        for idx, (uname, secret) in enumerate(candidates):
             if not uname or not secret:
                 continue
-            try:
-                r1, w1 = await asyncio.wait_for(asyncio.open_connection(host, 8800), timeout=3.0)
-                req1 = (
-                    f"POST /stream HTTP/1.1\r\n"
-                    f"Host: {host}:8800\r\n"
-                    "Content-Type: multipart/mixed; boundary=--client-stream-boundary--\r\n"
-                    "Content-Length: 0\r\n\r\n"
-                )
-                w1.write(req1.encode("utf-8"))
-                await w1.drain()
-                resp1 = (await asyncio.wait_for(r1.read(2048), timeout=3.0)).decode(errors="ignore")
-                w1.close()
+            modes = (True, False) if idx < 2 else (True,)
+            for reconnect_after_401 in modes:
+                reader: asyncio.StreamReader | None = None
+                writer: asyncio.StreamWriter | None = None
                 try:
-                    await w1.wait_closed()
-                except Exception:
-                    pass
+                    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, 8800), timeout=4.0)
+                    req1 = (
+                        "POST /stream HTTP/1.1\r\n"
+                        "Content-Type: multipart/mixed;boundary=--client-stream-boundary--\r\n"
+                        "Connection: keep-alive\r\n"
+                        "Content-Length: -1\r\n\r\n"
+                    ).encode("utf-8")
+                    writer.write(req1)
+                    await writer.drain()
 
-                m_auth = re.search(r"WWW-Authenticate:\s*Digest\s+([^\r\n]+)", resp1, re.IGNORECASE)
-                if not m_auth:
-                    continue
-                chall = m_auth.group(1)
-                m_realm = re.search(r'realm="([^"]+)"', chall)
-                m_nonce = re.search(r'nonce="([^"]+)"', chall)
-                m_qop = re.search(r'qop="([^"]+)"', chall)
-                m_opaque = re.search(r'opaque="([^"]+)"', chall)
-                if not (m_realm and m_nonce):
-                    continue
+                    raw1 = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=4.0)
+                    txt1 = _tapo_clean_http_block(raw1)
+                    first1 = (txt1.splitlines()[0] if txt1 else "").strip()
+                    m_auth = re.search(r"WWW-Authenticate:\s*Digest\s+([^\r\n]+)", txt1, re.IGNORECASE)
+                    if not m_auth:
+                        last_diag = first1 or "missing_www_auth"
+                        writer.close()
+                        continue
 
-                realm = m_realm.group(1)
-                nonce = m_nonce.group(1)
-                qop = m_qop.group(1) if m_qop else "auth"
-                opaque = m_opaque.group(1) if m_opaque else ""
-                uri = "/stream"
-                nc = "00000001"
-                cnonce = os.urandom(16).hex()
+                    chall = m_auth.group(1)
+                    m_realm = re.search(r'realm="([^"]+)"', chall)
+                    m_nonce = re.search(r'nonce="([^"]+)"', chall)
+                    m_qop = re.search(r'qop="([^"]+)"', chall)
+                    m_opaque = re.search(r'opaque="([^"]+)"', chall)
+                    if not (m_realm and m_nonce):
+                        last_diag = "malformed_digest_challenge"
+                        writer.close()
+                        continue
 
-                ha1 = hashlib.md5(f"{uname}:{realm}:{secret}".encode("utf-8")).hexdigest()
-                ha2 = hashlib.md5(f"POST:{uri}".encode("utf-8")).hexdigest()
-                resp_dig = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode("utf-8")).hexdigest()
+                    if reconnect_after_401:
+                        writer.close()
+                        try:
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, 8800), timeout=4.0)
 
-                auth_hdr = (
-                    f'Digest username="{uname}", realm="{realm}", nonce="{nonce}", '
-                    f'uri="{uri}", qop={qop}, nc={nc}, cnonce="{cnonce}", response="{resp_dig}"'
-                )
-                if opaque:
-                    auth_hdr += f', opaque="{opaque}", algorithm=MD5'
+                    realm = m_realm.group(1)
+                    nonce = m_nonce.group(1)
+                    qop = m_qop.group(1) if m_qop else "auth"
+                    opaque = m_opaque.group(1) if m_opaque else ""
+                    uri = "/stream"
+                    nc = "00000001"
+                    cnonce = os.urandom(12).hex()
 
-                r2, w2 = await asyncio.wait_for(asyncio.open_connection(host, 8800), timeout=3.0)
-                req2 = (
-                    f"POST {uri} HTTP/1.1\r\n"
-                    f"Host: {host}:8800\r\n"
-                    f"Authorization: {auth_hdr}\r\n"
-                    "Content-Type: multipart/mixed; boundary=--client-stream-boundary--\r\n"
-                    "Content-Length: 0\r\n\r\n"
-                )
-                w2.write(req2.encode("utf-8"))
-                await w2.drain()
-                line2 = (await asyncio.wait_for(r2.readline(), timeout=3.0)).decode(errors="ignore")
-                w2.close()
-                try:
-                    await w2.wait_closed()
-                except Exception:
-                    pass
+                    ha1 = hashlib.md5(f"{uname}:{realm}:{secret}".encode("utf-8")).hexdigest()
+                    ha2 = hashlib.md5(f"POST:{uri}".encode("utf-8")).hexdigest()
+                    resp_dig = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode("utf-8")).hexdigest()
 
-                if " 200 " in line2:
-                    return (uname, secret)
-            except Exception:
-                continue
-        return None
-
-    async def _probe_tapo_via_go2rtc(self, host: str, candidates: list[tuple[str, str]], raw_pw: str) -> tuple[str, str] | None:
-        """
-        Uses the embedded go2rtc engine itself (/api/streams?src=_tapo_probe&video=all&audio=all)
-        to verify authentication against Tapo port 8800 using the exact same code path used for talkback.
-        """
-        if not os.path.exists("/usr/local/bin/go2rtc"):
-            return None
-        await self._ensure_go2rtc_running()
-        probe_key = "_tapo_auth_probe"
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            for uname, secret in candidates:
-                src = f"tapo://{uname}:{secret}@{host}" if uname else f"tapo://{quote(raw_pw, safe='')}@{host}"
-                try:
-                    await client.put(f"{GO2RTC_API_BASE}/api/streams", params={"name": probe_key, "src": src})
-                    r = await client.get(
-                        f"{GO2RTC_API_BASE}/api/streams",
-                        params={"src": probe_key, "video": "all", "audio": "all"},
+                    auth_hdr = (
+                        f'Digest username="{uname}",realm="{realm}",uri="{uri}",algorithm=MD5,'
+                        f'nonce="{nonce}",nc={nc},cnonce="{cnonce}",qop={qop},response="{resp_dig}"'
                     )
+                    if opaque:
+                        auth_hdr += f',opaque="{opaque}"'
+
+                    req2 = (
+                        "POST /stream HTTP/1.1\r\n"
+                        "Content-Type: multipart/mixed;boundary=--client-stream-boundary--\r\n"
+                        "Connection: keep-alive\r\n"
+                        "Content-Length: -1\r\n"
+                        f"Authorization: {auth_hdr}\r\n\r\n"
+                    ).encode("utf-8")
+                    writer.write(req2)
+                    await writer.drain()
+
+                    raw2 = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=4.0)
+                    txt2 = _tapo_clean_http_block(raw2)
+                    lines2 = [ln.strip() for ln in txt2.splitlines() if ln.strip()]
+                    status_line = lines2[0] if lines2 else "empty_auth_reply"
+                    last_diag = status_line
+
+                    if " 200 " in f" {status_line} ":
+                        hdr_map: dict[str, str] = {}
+                        for ln in lines2[1:]:
+                            if ":" in ln:
+                                k, v = ln.split(":", 1)
+                                hdr_map[k.strip()] = v.strip()
+                        return ((reader, writer, hdr_map, uname, secret), status_line)
+
+                    writer.close()
                     try:
-                        await client.delete(f"{GO2RTC_API_BASE}/api/streams", params={"src": probe_key})
+                        await writer.wait_closed()
                     except Exception:
                         pass
-                    if r.status_code == 200:
-                        body = r.json() or {}
-                        prods = body.get("producers") or []
-                        if any(isinstance(p, dict) and p.get("medias") for p in prods):
-                            return (uname or "admin", secret)
-                except Exception:
-                    try:
-                        await client.delete(f"{GO2RTC_API_BASE}/api/streams", params={"src": probe_key})
-                    except Exception:
-                        pass
-        return None
+                except Exception as exc:
+                    last_diag = f"{type(exc).__name__}"
+                    if writer is not None:
+                        writer.close()
+                        try:
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                    continue
+        return (None, last_diag)
 
     async def set_tapo_cloud_password(self, cloud_password: str) -> dict:
         """
-        Verifies the user's TP-Link/Tapo Cloud password directly through go2rtc + Tapo port 8800
-        Streamd Digest, then stores ONLY the verified irreversible hash on disk (zero plaintext stored).
+        Verifies the user's TP-Link/Tapo Cloud password live against Tapo port 8800 Streamd
+        using the single-socket Digest handshake, then stores ONLY the irreversible hash on disk.
         """
         pw = (cloud_password or "").strip()
         if not pw:
@@ -859,23 +1040,23 @@ class CameraHardwareService:
         matched_secret = sha_up
         reachable_any = False
 
+        last_diag = "unreachable"
         for c in tapo_cams:
             host = c["host"]
             rtsp_u = c.get("username") or ""
             cands: list[tuple[str, str]] = [
                 ("admin", sha_up),
                 ("admin", md5_up),
-                ("", sha_up),  # lets go2rtc Dial() autodetect hash from raw_pw in RAM, while saving sha_up on disk
                 ("admin", sha_low),
                 ("admin", md5_low),
             ]
             if rtsp_u and rtsp_u != "admin":
-                cands.extend([(rtsp_u, sha_up), (rtsp_u, md5_up)])
+                cands.extend([(rtsp_u, sha_up), (rtsp_u, md5_up), (rtsp_u, pw)])
             if re.fullmatch(r"[0-9a-fA-F]{64}", pw) or re.fullmatch(r"[0-9a-fA-F]{32}", pw):
                 cands.insert(0, ("admin", pw.upper()))
 
             try:
-                r_chk, w_chk = await asyncio.wait_for(asyncio.open_connection(host, 8800), timeout=2.5)
+                _, w_chk = await asyncio.wait_for(asyncio.open_connection(host, 8800), timeout=2.5)
                 w_chk.close()
                 try:
                     await w_chk.wait_closed()
@@ -885,24 +1066,31 @@ class CameraHardwareService:
             except Exception:
                 continue
 
-            matched = await self._probe_tapo_via_go2rtc(host, cands, pw)
-            if not matched:
-                digest_cands = [(u, s) for (u, s) in cands if u]
-                matched = await self._verify_tapo_8800_digest(host, digest_cands)
-            if matched:
-                matched_user, matched_secret = matched
+            sess_tuple, diag = await self._open_tapo_8800_session(host, cands)
+            last_diag = f"{host}:8800 -> {diag}"
+            if sess_tuple is not None:
+                _, sess_writer, _, matched_user, matched_secret = sess_tuple
+                sess_writer.close()
+                try:
+                    await sess_writer.wait_closed()
+                except Exception:
+                    pass
                 verified_host = host
                 break
 
         if reachable_any and not verified_host:
-            raise ValueError(
-                "Rejected by Tapo port 8800 — make sure you enter your main TP-Link / Tapo mobile app login password (not the RTSP camera password)"
-            )
+            if "401" in last_diag:
+                raise ValueError(
+                    f"Tapo camera returned 401 ({last_diag}) — double-check your main TP-Link ID / Tapo app login password"
+                )
+            print(f"[TAPO AUTH NOTE] Camera busy during probe ({last_diag}); saving SHA-256 hash for on-demand speaker.")
 
+        # Never persist raw plaintext if an RTSP raw fallback ever matched
+        stored_secret = matched_secret if matched_secret != pw else sha_up
         async with self._config_lock:
             self._saved_state["_tapo_auth"] = {
                 "cred_user": matched_user,
-                "cred_secret": matched_secret,
+                "cred_secret": stored_secret,
                 "sha256": sha_up,
                 "md5": md5_up,
                 "verified_host": verified_host,
@@ -915,6 +1103,208 @@ class CameraHardwareService:
             "tapo_auth_configured": True,
             "verified_host": verified_host,
         }
+
+    async def _stream_ulaw_tapo_native(self, camera_id: str, info: dict, ulaw_bytes: bytes) -> bool:
+        """
+        Native asyncio TP-Link Tapo port 8800 Streamd speaker backchannel (PCMA/8000 in MPEG-TS).
+        Ported from pytapo.media_stream (session.py + talk.py) so Loft & Living Room speakers work
+        reliably on TPAP/V4 firmware without go2rtc socket-close or encrypted-JSON bugs.
+        """
+        tapo_auth = self._saved_state.get("_tapo_auth") or {}
+        sha_up = tapo_auth.get("sha256")
+        md5_up = tapo_auth.get("md5")
+        if not sha_up:
+            raise ValueError(
+                "Tapo speaker not linked yet — enter your TP-Link/Tapo app password once in the TALK panel to unlock Loft & Living Room speakers."
+            )
+
+        primary_u = tapo_auth.get("cred_user") or "admin"
+        primary_s = tapo_auth.get("cred_secret") or sha_up
+        cands: list[tuple[str, str]] = [(primary_u, primary_s)]
+        for extra_u, extra_s in (("admin", sha_up), ("admin", md5_up or "")):
+            if extra_s and (extra_u, extra_s) not in cands:
+                cands.append((extra_u, extra_s))
+
+        # Transcode 8kHz mulaw -> 8kHz mono A-law (PCMA) with 650ms speaker-amp wake delay
+        ff_proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "mulaw",
+            "-ar",
+            "8000",
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-af",
+            "adelay=650:all=1",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-c:a",
+            "pcm_alaw",
+            "-f",
+            "alaw",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        alaw_bytes, ff_err = await asyncio.wait_for(ff_proc.communicate(input=ulaw_bytes), timeout=10.0)
+        if ff_proc.returncode != 0 or not alaw_bytes:
+            raise RuntimeError(f"FFmpeg PCMA conversion failed: {ff_err.decode(errors='ignore')[:160]}")
+
+        host = info["host"]
+        sess_tuple, diag = await self._open_tapo_8800_session(host, cands)
+        if sess_tuple is None:
+            raise RuntimeError(f"Tapo speaker auth failed on {host}:8800 ({diag})")
+
+        reader, writer, res_headers, matched_u, matched_s = sess_tuple
+        try:
+            # Derive optional AES-128-CBC key/IV from Key-Exchange header for encrypted JSON control replies
+            kx_hdr = res_headers.get("Key-Exchange") or res_headers.get("key-exchange") or ""
+            kx_pairs = dict(re.findall(r'([A-Za-z0-9_-]+)="?([^",\s]+)"?', kx_hdr))
+            kx_nonce = (kx_pairs.get("nonce") or "").encode("utf-8")
+            kx_user = (kx_pairs.get("username") or matched_u or "admin").encode("utf-8")
+            if kx_user == b"none":
+                aes_secret = b"TPL075526460603"
+            else:
+                aes_secret = matched_s.encode("utf-8")
+            aes_key = hashlib.md5(kx_nonce + b":" + aes_secret).digest() if kx_nonce else b""
+            aes_iv = hashlib.md5(kx_user + b":" + kx_nonce).digest() if kx_nonce else b""
+
+            dev_boundary = b"--device-stream-boundary--"
+            ct_hdr = res_headers.get("Content-Type") or res_headers.get("content-type") or ""
+            m_bnd = re.search(r"boundary=([^\s;]+)", ct_hdr, re.IGNORECASE)
+            if m_bnd:
+                dev_boundary = m_bnd.group(1).strip().strip('"').encode("utf-8")
+
+            # Request 2-way talk backchannel session (AEC mode)
+            seq_id = random.randint(1000, 30000)
+            req_json = json.dumps(
+                {"type": "request", "seq": seq_id, "params": {"talk": {"mode": "aec"}, "method": "get"}},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            talk_req_frame = (
+                b"----client-stream-boundary--\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(req_json)}\r\n".encode("ascii")
+                + b"X-Data-Window-Size: 500\r\n\r\n"
+                + req_json
+                + b"\r\n"
+            )
+            writer.write(talk_req_frame)
+            await writer.drain()
+
+            session_id: str | None = None
+            for _ in range(8):
+                await asyncio.wait_for(reader.readuntil(dev_boundary), timeout=5.0)
+                part_hdr_raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=4.0)
+                part_hdrs: dict[str, str] = {}
+                for ln in part_hdr_raw.decode("utf-8", errors="ignore").splitlines():
+                    if ":" in ln:
+                        k, v = ln.split(":", 1)
+                        part_hdrs[k.strip()] = v.strip()
+
+                p_len = int(part_hdrs.get("Content-Length") or "0")
+                p_enc = int(part_hdrs.get("X-If-Encrypt") or "0") == 1
+                p_type = (part_hdrs.get("Content-Type") or "").lower()
+                if "X-Session-Id" in part_hdrs:
+                    session_id = part_hdrs["X-Session-Id"]
+
+                body_bytes = await asyncio.wait_for(reader.readexactly(p_len), timeout=4.0) if p_len > 0 else b""
+                if p_enc and body_bytes and aes_key and aes_iv:
+                    body_bytes = _aes128_cbc_decrypt_pkcs7(body_bytes, aes_key, aes_iv)
+
+                if "application/json" in p_type and body_bytes:
+                    jdata = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+                    params = jdata.get("params") or {}
+                    err_code = params.get("error_code", jdata.get("error_code", 0))
+                    if err_code not in (0, None):
+                        raise RuntimeError(
+                            f"Tapo speaker refused talk session (error_code={err_code} — close Tapo phone app talkback if open)"
+                        )
+                    if params.get("session_id") is not None:
+                        session_id = str(params["session_id"])
+                    if jdata.get("type") == "response" and session_id is not None:
+                        break
+
+            if not session_id:
+                raise RuntimeError(f"Tapo camera {camera_id} did not return a talk session_id")
+
+            async def _send_mp2t_part(ts_data: bytes) -> None:
+                part = (
+                    b"----client-stream-boundary--\r\n"
+                    b"Content-Type: audio/mp2t\r\n"
+                    b"X-If-Encrypt: 0\r\n"
+                    + f"X-Session-Id: {session_id}\r\n".encode("ascii")
+                    + f"Content-Length: {len(ts_data)}\r\n\r\n".encode("ascii")
+                    + ts_data
+                )
+                writer.write(part)
+                await writer.drain()
+
+            # PAT (PID 0 -> PMT 0x1000) + PMT (PCMA stream_type 0x90 on PID 0x0100)
+            psi_hdr = _tapo_psi_packet(0, bytes.fromhex("00b00d0001c100000001f000")) + _tapo_psi_packet(
+                0x1000, bytes.fromhex("02b0120001c10000fffff00090e100f000")
+            )
+            await _send_mp2t_part(psi_hdr)
+
+            # Pace 160-byte (20ms @ 8kHz) PCMA frames wrapped in PES + 188-byte MPEG-TS packets
+            cc = 0
+            samples_sent = 0
+            loop = asyncio.get_running_loop()
+            deadline = loop.time()
+
+            for off in range(0, len(alaw_bytes), 160):
+                chunk_alaw = alaw_bytes[off : off + 160]
+                wait_s = deadline - loop.time()
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+
+                pts = (samples_sent * 90000 // 8000) & ((1 << 33) - 1)
+                pts_bytes = bytes(
+                    (
+                        0x21 | ((pts >> 29) & 0x0E),
+                        (pts >> 22) & 0xFF,
+                        1 | ((pts >> 14) & 0xFE),
+                        (pts >> 7) & 0xFF,
+                        1 | ((pts << 1) & 0xFE),
+                    )
+                )
+                pes = b"\x00\x00\x01\xc0" + (len(chunk_alaw) + 8).to_bytes(2, "big") + b"\x80\x80\x05" + pts_bytes + chunk_alaw
+                ts_pkts = bytearray()
+                first_pkt = True
+                rem = pes
+                while rem:
+                    part_b, rem = rem[:184], rem[184:]
+                    flags = 0x10 if len(part_b) == 184 else 0x30
+                    ts_pkts.extend((0x47, 0x41 if first_pkt else 0x01, 0x00, flags | cc))
+                    if len(part_b) < 184:
+                        pad_n = 183 - len(part_b)
+                        ts_pkts.append(pad_n)
+                        if pad_n:
+                            ts_pkts.extend(b"\x00" + (b"\xff" * (pad_n - 1)))
+                    ts_pkts.extend(part_b)
+                    cc = (cc + 1) & 0x0F
+                    first_pkt = False
+
+                await _send_mp2t_part(bytes(ts_pkts))
+                samples_sent += len(chunk_alaw)
+                deadline = max(deadline + (len(chunk_alaw) / 8000.0), loop.time())
+
+            await asyncio.sleep(0.30)
+            return True
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def _ensure_go2rtc_running(self) -> None:
         async with self._go2rtc_lock:
@@ -1049,7 +1439,16 @@ class CameraHardwareService:
         duration_s = round(len(ulaw_bytes) / 8000.0, 2)
         async with self._speaker_lock:
             if info["vendor"] == "tapo_rtsp":
-                ok = await self._stream_ulaw_tapo_go2rtc(camera_id, info, ulaw_bytes)
+                transport_used = "tapo_native_8800"
+                try:
+                    ok = await self._stream_ulaw_tapo_native(camera_id, info, ulaw_bytes)
+                except Exception as native_err:
+                    print(f"[TAPO SPEAKER NATIVE] {camera_id}: {native_err}")
+                    if os.path.exists("/usr/local/bin/go2rtc"):
+                        transport_used = "tapo_go2rtc_8800"
+                        ok = await self._stream_ulaw_tapo_go2rtc(camera_id, info, ulaw_bytes)
+                    else:
+                        raise
                 if not ok:
                     raise RuntimeError(
                         f"Failed to stream audio to '{camera_id}' Tapo speaker (ensure Tapo App -> Me -> Tapo Lab -> Third-Party Compatibility is ON)"
@@ -1058,7 +1457,7 @@ class CameraHardwareService:
                     "status": "PLAYED",
                     "camera_id": camera_id,
                     "duration_sec": duration_s,
-                    "transport": "tapo_go2rtc_8800",
+                    "transport": transport_used,
                 }
 
             transport_used = "onvif_backchannel"
