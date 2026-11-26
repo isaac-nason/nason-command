@@ -464,6 +464,14 @@ export function PerimeterSecurityPanel({
                 {bypassedCount} BYPASSED
               </span>
             )}
+            {(snap.household_grace_remaining || 0) > 0 && alarmState === 'disarmed' && (
+              <span
+                title={`Driveway breach alerts auto-paused during household activity (${snap.household_grace_reason || 'Door/Vehicle'}) — Deliveries & Watchlist still alert`}
+                className="ml-1.5 px-1.5 py-0.5 rounded bg-emerald-950/90 border border-emerald-500/40 text-emerald-300 text-[9px] font-bold"
+              >
+                🏠 UNLOAD SHIELD · {formatGrace(snap.household_grace_remaining)}
+              </span>
+            )}
           </span>
         </div>
 

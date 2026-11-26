@@ -389,6 +389,46 @@ async def _evaluate_best_confidence_push(
         ):
             return
 
+        # 2c. Household Driveway Unloading / Car-Seat Shield (HOME Mode only):
+        # Suppresses repetitive driveway 'person' breach alerts while getting kids/groceries out of cars after:
+        #   - YoLink Front Door / Garage Door egress while HOME (12m auto-refreshing grace), OR
+        #   - A whitelisted 🏠 Resident Vehicle arrival or Family Face ID on DRIVEWAY within the past 15 minutes.
+        # Genuine 📦 DELIVERY and ⚠️ WATCHLIST detections still alert normally!
+        if (
+            (not away_active)
+            and (not cam_alert_all)
+            and perim_state == "disarmed"
+            and ev.camera_id == "annke_1"
+            and ev.category == "person"
+            and "WATCHLIST" not in (ev.sub_type or "").upper()
+        ):
+            hh_grace_active, _, _ = perim_svc.get_household_driveway_grace()
+            if hh_grace_active:
+                perim_svc.note_household_driveway_activity("Ongoing driveway unloading", is_extension=True)
+                return
+            if ev.timestamp:
+                async with AsyncSessionLocal() as hh_sess:
+                    hh_recent = await hh_sess.execute(
+                        select(DetectionEvent.id)
+                        .where(
+                            DetectionEvent.camera_id == "annke_1",
+                            DetectionEvent.id != ev.id,
+                            DetectionEvent.timestamp >= ev.timestamp - _td(minutes=15),
+                            DetectionEvent.timestamp <= ev.timestamp + _td(seconds=30),
+                            (
+                                DetectionEvent.sub_type.like("🏠%")
+                                | (
+                                    DetectionEvent.sub_type.like("ID: %")
+                                    & (~DetectionEvent.sub_type.like("ID: VISITOR_%"))
+                                )
+                            ),
+                        )
+                        .limit(1)
+                    )
+                    if hh_recent.scalar_one_or_none() is not None:
+                        perim_svc.note_household_driveway_activity("Recent household arrival", duration_sec=600.0)
+                        return
+
         def _cat_group(c: str | None) -> str:
             return "person_or_delivery" if c in ("person", "delivery") else (c or "other")
 
@@ -707,10 +747,16 @@ async def deep_inspect_detection(event_id: int) -> dict:
                             select(DetectionEvent.id)
                             .where(
                                 DetectionEvent.camera_id == "annke_1",
-                                DetectionEvent.category == "vehicle",
-                                DetectionEvent.sub_type.like("🏠%"),
-                                DetectionEvent.timestamp >= ev.timestamp - _td(minutes=6),
+                                DetectionEvent.id != ev.id,
+                                DetectionEvent.timestamp >= ev.timestamp - _td(minutes=15),
                                 DetectionEvent.timestamp <= ev.timestamp + _td(seconds=30),
+                                (
+                                    DetectionEvent.sub_type.like("🏠%")
+                                    | (
+                                        DetectionEvent.sub_type.like("ID: %")
+                                        & (~DetectionEvent.sub_type.like("ID: VISITOR_%"))
+                                    )
+                                ),
                             )
                             .limit(1)
                         )
@@ -741,10 +787,11 @@ async def deep_inspect_detection(event_id: int) -> dict:
                         "Populate 'plate' ONLY when 'category' is 'vehicle' (an actively moving/arriving/departing vehicle with a legible plate; omit the central Oregon tree icon between digits and letters). For all person, delivery, or animal detections, ALWAYS set 'plate' to 'NONE' (NEVER read license plates off parked background cars). "
                         f"Set 'carrier' to one of {active_rule_names} when clear delivery/service evidence is visible across Image 1 (subject crop) and Image 2 (wide driveway/street context): LANDSCAPERS (mowers/blowers/trimmers/crew vests), AMAZON (Amazon smile arrow logo OR two-tone sky-blue/cyan and dark-navy reflective delivery vest with horizontal silver/grey stripes — NOTE: at night under camera floodlight/IR, the vest's retroreflective bands glow/bloom intensely bright white over light-blue vest fabric — especially when carrying brown/white parcels or mailers, or stepping out of a dark-grey/blue/white commercial cargo/Sprinter delivery van with open sliding door stopped at the curb in Image 2), UPS/FEDEX/USPS (branded carrier vest/uniform, delivery van/truck at curb, or shipping parcel + scanner), or FOOD_DELIVERY (ONLY when a courier approaches from the street holding an insulated rectangular red/black thermal pizza/food bag or flat horizontal cardboard pizza boxes — NEVER set FOOD_DELIVERY for empty-handed walkers, children, restaurant logo T-shirts, drinks/cans, laundry baskets, or people interacting with parked driveway cars); otherwise set 'carrier' to 'NONE'. "
                         "CRITICAL GUARDRAIL: Residents rolling wheeled curbside trash, recycling, or yard-waste bins (blue, black, green, or gray plastic carts with lids/wheels) or carrying open plastic laundry baskets are household activity ('category': 'person', 'carrier': 'NONE'). "
+                        "Set 'household_car_unloading' to true ONLY when a person is actively loading or unloading groceries, bags, car seats, or children through a visibly OPEN side door or OPEN rear trunk/hatch of a parked driveway vehicle (NEVER set true for couriers carrying branded packages/thermal bags from the street, and NEVER set true for someone merely walking past or pulling closed door handles). "
                         "Set 'school_commuter' to true ONLY if the subject is a student/youth wearing a school backpack who is casually walking along the public sidewalk or exiting away toward the street with NO package delivery and NO tampering with vehicles/house. "
                         "Set 'face_visible' to true ONLY if a person's actual facial features (eyes/nose) are clearly visible in Image 1 (the close-up crop); set 'face_visible' to false if walking away, only the back of their head/hoodie/backpack is visible, blurry night silhouette, or head cropped out. "
                         "Respond ONLY with valid JSON: "
-                        '{"valid_target": true, "face_visible": false, "school_commuter": false, "category": "person|delivery|vehicle|animal|false_alarm", '
+                        '{"valid_target": true, "face_visible": false, "school_commuter": false, "household_car_unloading": false, "category": "person|delivery|vehicle|animal|false_alarm", '
                         '"sub_type": "short label like cat, dog, white suv, or person", '
                         '"plate": "NONE", '
                         f'"carrier": "{"|".join(active_rule_names)}|NONE", '
@@ -785,6 +832,7 @@ async def deep_inspect_detection(event_id: int) -> dict:
                             valid_target = bool(parsed.get("valid_target", True))
                             face_visible = bool(parsed.get("face_visible", True))
                             school_commuter = bool(parsed.get("school_commuter", False))
+                            household_car_unloading = bool(parsed.get("household_car_unloading", False))
                             vlm_cat = str(parsed.get("category") or ev.category).strip().lower()
                             summary = (parsed.get("summary") or "").strip()
                             if ev.camera_id == "annke_1":
@@ -964,6 +1012,13 @@ async def deep_inspect_detection(event_id: int) -> dict:
                                     veh_lbl = str(matched_rv.get("vehicle_label") or vlm_sub or "VEHICLE").upper()
                                     ev.sub_type = f"🏠 {owner_up}'S {veh_lbl} [PLATE: {plate}]"[:120]
                                     ev.full_label = f"{ev.motion_slot}_{owner_up}_VEHICLE"[:120]
+                                    if ev.camera_id == "annke_1":
+                                        perim_svc_rv = __import__(
+                                            "app.services.perimeter_security", fromlist=["perimeter_service"]
+                                        ).perimeter_service
+                                        perim_svc_rv.note_household_driveway_activity(
+                                            f"{owner_up}'s {veh_lbl} arrival", duration_sec=900.0
+                                        )
                                 else:
                                     plate_str = f" [PLATE: {plate}]" if plate else " [NO PLATE VIEW]"
                                     desc = vlm_sub.upper() if vlm_sub and vlm_sub != "none" else (ev.sub_type or "VEHICLE").upper()
@@ -989,6 +1044,89 @@ async def deep_inspect_detection(event_id: int) -> dict:
             )
             if is_isaac and "_BREACH" in (ev.full_label or ""):
                 ev.full_label = ev.full_label.replace("_BREACH", "")
+
+            perim_svc_di = __import__("app.services.perimeter_security", fromlist=["perimeter_service"]).perimeter_service
+            if ev.camera_id == "annke_1" and face_role == "whitelist" and recognized_face:
+                wl_short = (ev.sub_type or "").replace("ID:", "").strip() or "FAMILY"
+                perim_svc_di.note_household_driveway_activity(f"Family ID: {wl_short}", duration_sec=900.0)
+
+            # Sensor-Fused Household Driveway Unloading Shield (HOME Mode only):
+            # Converts blurry/back-turned driveway 'person' breach cards during active household unloading
+            # (YoLink Front/Garage Door egress, 15m post-arrival of 🏠 vehicle / family Face ID, or VLM open-door
+            # unloading outside 00:00–05:30 PT) into emerald 🏠 HOUSEHOLD ACTIVITY cards with zero push spam.
+            if (
+                ev.camera_id == "annke_1"
+                and ev.category == "person"
+                and face_role not in ("whitelist", "watchlist", "watchlist_auto")
+                and "WATCHLIST" not in upper_sub
+                and perim_svc_di.alarm_state == "disarmed"
+            ):
+                push_cfg_di = await get_push_config()
+                away_di = bool(getattr(push_cfg_di, "away_mode", False)) and (
+                    time.time() >= float(getattr(push_cfg_di, "away_armed_at", 0.0) or 0.0)
+                )
+                if not away_di:
+                    hh_active, _, hh_reason = perim_svc_di.get_household_driveway_grace()
+                    vlm_unload_ok = False
+                    if vlm_succeeded and locals().get("household_car_unloading") and ev.timestamp:
+                        hm_now = ev.timestamp.astimezone(_LOCAL_TZ).strftime("%H:%M")
+                        if not ("00:00" <= hm_now <= "05:30"):
+                            vlm_unload_ok = True
+                    recent_hh_db = bool(locals().get("recent_household_car_arrival"))
+                    if not hh_active and not recent_hh_db and ev.timestamp:
+                        hh_chk = await session.execute(
+                            select(DetectionEvent.id)
+                            .where(
+                                DetectionEvent.camera_id == "annke_1",
+                                DetectionEvent.id != ev.id,
+                                DetectionEvent.timestamp >= ev.timestamp - _td(minutes=15),
+                                DetectionEvent.timestamp <= ev.timestamp + _td(seconds=30),
+                                (
+                                    DetectionEvent.sub_type.like("🏠%")
+                                    | (
+                                        DetectionEvent.sub_type.like("ID: %")
+                                        & (~DetectionEvent.sub_type.like("ID: VISITOR_%"))
+                                    )
+                                ),
+                            )
+                            .limit(1)
+                        )
+                        recent_hh_db = hh_chk.scalar_one_or_none() is not None
+
+                    if hh_active or recent_hh_db or vlm_unload_ok:
+                        shield_label = (
+                            hh_reason
+                            if hh_active
+                            else ("Recent household arrival" if recent_hh_db else "Parked vehicle unloading")
+                        )
+                        if hh_active:
+                            perim_svc_di.note_household_driveway_activity(shield_label, is_extension=True)
+                        else:
+                            perim_svc_di.note_household_driveway_activity(shield_label, duration_sec=720.0)
+
+                        if face_info and face_info.get("auto_enrolled") and str(face_info.get("name", "")).startswith("VISITOR_"):
+                            vf_rows = (
+                                await session.execute(select(_KnownFace).where(_KnownFace.name == face_info["name"]))
+                            ).scalars().all()
+                            for vf in vf_rows:
+                                if vf.sample_crop and str(vf.sample_crop).startswith("/face_crops/"):
+                                    dcrop = f"/tmp/command_faces/{os.path.basename(vf.sample_crop)}"
+                                    if os.path.exists(dcrop):
+                                        try:
+                                            os.remove(dcrop)
+                                        except OSError:
+                                            pass
+                                await session.execute(delete(_KnownFace).where(_KnownFace.id == vf.id))
+                            recognized_face = None
+                            face_role = None
+
+                        ev.sub_type = "🏠 HOUSEHOLD ACTIVITY"
+                        ev.full_label = f"{ev.motion_slot}_HOUSEHOLD_ACTIVITY"
+                        if ai_notes_out:
+                            clean_prev = re.sub(r"^🧬\s*\[VISITOR_\d+[^\]]*\]\s*", "", ai_notes_out).replace("🚨 [BREACH] ", "").strip()
+                            ai_notes_out = f"🏠 [Auto-shielded: {shield_label}] {clean_prev}"
+                        else:
+                            ai_notes_out = f"🏠 [Auto-shielded: {shield_label}] Household driveway activity"
 
             # Edge Fallback Note when Windows RTX 3060 Ti (192.168.1.223) is asleep/offline
             if not ai_notes_out:

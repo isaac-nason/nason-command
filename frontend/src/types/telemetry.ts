@@ -114,6 +114,8 @@ export interface PerimeterSnapshot {
   auto_disarm_enabled: boolean;
   auto_disarm_time: string;
   away_grace_remaining: number;
+  household_grace_remaining?: number;
+  household_grace_reason?: string;
   last_error: string | null;
   zones: PerimeterZone[];
 }

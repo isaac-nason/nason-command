@@ -111,6 +111,9 @@ class PerimeterSecurityService:
         self.armed_via_away: bool = bool(saved_state.get("armed_via_away", False))
         self.away_grace_until: float = 0.0
         self.last_auto_disarm_date: str = saved_state.get("last_auto_disarm_date", "")
+        self.household_driveway_grace_until: float = float(saved_state.get("household_driveway_grace_until") or 0.0)
+        self.household_driveway_grace_origin: float = float(saved_state.get("household_driveway_grace_origin") or 0.0)
+        self.household_grace_reason: str = str(saved_state.get("household_grace_reason") or "")
 
         self.online: bool = False
         self.mqtt_live: bool = False
@@ -250,6 +253,9 @@ class PerimeterSecurityService:
             "triggered_at": self.triggered_at,
             "armed_via_away": self.armed_via_away,
             "last_auto_disarm_date": self.last_auto_disarm_date,
+            "household_driveway_grace_until": self.household_driveway_grace_until,
+            "household_driveway_grace_origin": self.household_driveway_grace_origin,
+            "household_grace_reason": self.household_grace_reason,
         }
         try:
             with open(STATE_PATH, "w", encoding="utf-8") as f:
@@ -307,6 +313,72 @@ class PerimeterSecurityService:
             )
         return out
 
+    def _is_house_egress_door(self, entity_id: str, zone_name: str, raw_name: str = "") -> bool:
+        """
+        True strictly for interior-to-exterior house egress doors leading toward the porch/driveway
+        (Front Door, Door to Garage / Garage Entry, Garage Overhead Door). Excludes windows and outdoor
+        fence gates so opening a side gate from outside never grants a driveway grace window.
+        """
+        pins = self.config.get("zone_pins") or {}
+        pin_id = str(pins.get(entity_id) or "").strip().lower()
+        if pin_id:
+            return pin_id in ("front_entry", "garage_entry", "garage_overhead")
+
+        hay = f"{entity_id} {zone_name} {raw_name}".lower()
+        if "win" in hay or "gate" in hay or "fence" in hay:
+            return False
+        if "garage" in hay:
+            return True
+        if "front" in hay and ("door" in hay or "entry" in hay):
+            return True
+        return False
+
+    def note_household_driveway_activity(
+        self,
+        reason: str,
+        duration_sec: float = 720.0,
+        is_extension: bool = False,
+    ) -> None:
+        if self.alarm_state != "disarmed":
+            return
+        now = time.time()
+        if is_extension:
+            if now < self.household_driveway_grace_until:
+                cap_ts = (self.household_driveway_grace_origin or now) + 1800.0
+                self.household_driveway_grace_until = min(cap_ts, max(self.household_driveway_grace_until, now + 300.0))
+                self._persist_state()
+            return
+
+        if now >= self.household_driveway_grace_until:
+            self.household_driveway_grace_origin = now
+        self.household_driveway_grace_until = max(self.household_driveway_grace_until, now + duration_sec)
+        self.household_grace_reason = (reason or "Household egress")[:64]
+        self._persist_state()
+
+    def get_household_driveway_grace(self) -> tuple[bool, int, str]:
+        if self.alarm_state != "disarmed":
+            return (False, 0, "")
+        now = time.time()
+        for z in self._active_zones_list():
+            if z.get("state") == "OPEN" and self._is_house_egress_door(
+                z["entity_id"], z["name"], z.get("raw_name") or ""
+            ):
+                if self.household_driveway_grace_until < now + 720.0:
+                    if now >= self.household_driveway_grace_until:
+                        self.household_driveway_grace_origin = now
+                    self.household_driveway_grace_until = now + 720.0
+                    self.household_grace_reason = f"Open: {z['name']}"[:64]
+                    self._persist_state()
+                return (True, int(round(self.household_driveway_grace_until - now)), f"Open: {z['name']}")
+
+        if now < self.household_driveway_grace_until:
+            return (
+                True,
+                max(1, int(round(self.household_driveway_grace_until - now))),
+                self.household_grace_reason or "Household activity",
+            )
+        return (False, 0, "")
+
     def get_snapshot(self) -> dict:
         transport = self._resolve_transport()
         is_mock = transport == "mock" or (not self.online and not self.zones_map)
@@ -314,6 +386,7 @@ class PerimeterSecurityService:
         open_zones = [z["name"] for z in zones if z["state"] == "OPEN"]
         now = time.time()
         grace_rem = max(0, int(round(self.away_grace_until - now))) if self.alarm_state == "arming" else 0
+        _, hh_grace_rem, hh_grace_why = self.get_household_driveway_grace()
         siren_names = [s["name"] for s in self.sirens_map.values()]
         siren_label = siren_names[0] if siren_names else "Master Bedroom Siren"
 
@@ -335,6 +408,8 @@ class PerimeterSecurityService:
             "auto_disarm_enabled": bool(self.config.get("auto_disarm_enabled", True)),
             "auto_disarm_time": self.config.get("auto_disarm_time", "05:00"),
             "away_grace_remaining": grace_rem,
+            "household_grace_remaining": hh_grace_rem,
+            "household_grace_reason": hh_grace_why,
             "last_error": self.last_error,
             "zones": zones,
         }
@@ -355,6 +430,8 @@ class PerimeterSecurityService:
             self.bypassed_zones |= {z["entity_id"] for z in open_items}
         self.alarm_state = "armed_night"
         self.armed_via_away = False
+        self.household_driveway_grace_until = 0.0
+        self.household_grace_reason = ""
         self.triggered_by = None
         self.triggered_zones = []
         self.triggered_entity_ids = []
@@ -372,6 +449,8 @@ class PerimeterSecurityService:
         now = time.time()
         if away:
             self.armed_via_away = True
+            self.household_driveway_grace_until = 0.0
+            self.household_grace_reason = ""
             if away_armed_at > now + 1.0:
                 self.away_grace_until = away_armed_at
                 if self.alarm_state != "triggered":
@@ -389,6 +468,8 @@ class PerimeterSecurityService:
         self.bypassed_zones = {z["entity_id"] for z in zones if z["state"] == "OPEN"}
         self.alarm_state = "armed_away"
         self.away_grace_until = 0.0
+        self.household_driveway_grace_until = 0.0
+        self.household_grace_reason = ""
         self.triggered_by = None
         self.triggered_zones = []
         self.triggered_entity_ids = []
@@ -489,6 +570,16 @@ class PerimeterSecurityService:
         return {"success": True, "snapshot": self.get_snapshot()}
 
     async def _handle_zone_transition(self, entity_id: str, zone_name: str, new_state: str):
+        if self.alarm_state == "disarmed":
+            raw_z = self.zones_map.get(entity_id) or next(
+                (m for m in self.mock_zones if m["entity_id"] == entity_id), {}
+            )
+            if self._is_house_egress_door(entity_id, zone_name, str(raw_z.get("name") or "")):
+                self.note_household_driveway_activity(
+                    f"Door: {zone_name}",
+                    duration_sec=720.0,
+                )
+
         if new_state == "CLOSED" and entity_id in self.bypassed_zones:
             # Once a bypassed window/door is closed, automatically fold it back into the protected perimeter
             self.bypassed_zones.discard(entity_id)
